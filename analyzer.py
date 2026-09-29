@@ -163,11 +163,13 @@ def analyze_news(articles_by_source: dict[str, list[NewsArticle]], errors: list[
         except Exception as exc:
             last_error = exc
             log.warning("Model '%s' failed: %s: %s", cand_model, type(exc).__name__, exc)
-            # If it's 404 (not found) or 429 (quota exceeded / limit: 0), try next candidate model
+            # Only abort if authentication itself failed (401 invalid api key)
             err_str = str(exc).lower()
-            can_retry_next = any(keyword in err_str for keyword in ["not found", "404", "quota", "429", "resource_exhausted"])
-            if not can_retry_next:
+            if "401" in err_str or "invalid_api_key" in err_str or "unauthenticated" in err_str:
+                log.error("Authentication failed. Aborting model retries.")
                 break
+            # Otherwise continue trying remaining candidate models
+
 
 
     err_msg = f"大模型调用失败: {type(last_error).__name__}: {last_error}"
