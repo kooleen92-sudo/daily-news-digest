@@ -115,35 +115,60 @@ def analyze_news(articles_by_source: dict[str, list[NewsArticle]], errors: list[
         log.info("OPENAI_API_KEY is not configured. Using structured fallback report.")
         return generate_fallback_report(articles_by_source, errors)
 
-    log.info("Requesting LLM analysis via model '%s'...", config.llm_model)
+    # Clean inputs
+    model_name = config.llm_model.strip().lower().replace(" ", "-")
+    base_url = config.openai_base_url.strip() if config.openai_base_url else None
+    
+    # If base_url is google generative language, ensure correct OpenAI endpoint structure
+    if base_url and "googleapis.com" in base_url and not base_url.endswith("/openai/"):
+        base_url = base_url.rstrip("/") + "/openai/"
+
+    log.info("Requesting LLM analysis via model '%s' (base_url: %s)...", model_name, base_url)
     articles_text = format_articles_for_prompt(articles_by_source)
     prompt = USER_PROMPT_TEMPLATE.format(articles_text=articles_text)
 
     client_kwargs = {
-        "api_key": config.openai_api_key,
+        "api_key": config.openai_api_key.strip(),
         "timeout": config.llm_timeout,
-        "max_retries": 2,
+        "max_retries": 1,
     }
-    if config.openai_base_url:
-        client_kwargs["base_url"] = config.openai_base_url
+    if base_url:
+        client_kwargs["base_url"] = base_url
 
     client = OpenAI(**client_kwargs)
 
-    try:
-        response = client.chat.completions.create(
-            model=config.llm_model,
-            temperature=0.3,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-        )
-        content = response.choices[0].message.content
-        if content and len(content.strip()) > 50:
-            return content.strip()
-        else:
-            log.warning("LLM response was empty or too short. Using fallback.")
-            return generate_fallback_report(articles_by_source, errors)
-    except Exception as exc:
-        log.error("LLM analysis failed: %s: %s. Falling back to structured list.", type(exc).__name__, exc)
-        return generate_fallback_report(articles_by_source, errors)
+    # Candidate models to try if the first one returns 404 (e.g. invalid Gemini preview ID)
+    candidates = [model_name]
+    if "gemini" in model_name:
+        for fallback in ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]:
+            if fallback not in candidates:
+                candidates.append(fallback)
+
+    last_error = None
+    for cand_model in candidates:
+        try:
+            log.info("Attempting LLM completion with model: %s", cand_model)
+            response = client.chat.completions.create(
+                model=cand_model,
+                temperature=0.3,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            content = response.choices[0].message.content
+            if content and len(content.strip()) > 50:
+                log.info("LLM completion succeeded with model: %s", cand_model)
+                return content.strip()
+        except Exception as exc:
+            last_error = exc
+            log.warning("Model '%s' failed: %s: %s", cand_model, type(exc).__name__, exc)
+            # If not a model-not-found error, don't keep trying candidate models
+            if "not found" not in str(exc).lower() and "404" not in str(exc):
+                break
+
+    err_msg = f"大模型调用失败: {type(last_error).__name__}: {last_error}"
+    log.error("%s. Falling back to structured list.", err_msg)
+    errors.append(err_msg)
+    return generate_fallback_report(articles_by_source, errors)
+
