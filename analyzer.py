@@ -137,43 +137,60 @@ def analyze_news(articles_by_source: dict[str, list[NewsArticle]], errors: list[
 
     client = OpenAI(**client_kwargs)
 
-    # Candidate models to try if the first one returns 404 (e.g. invalid Gemini preview ID)
+    # Candidate models to try if the primary model is retired or not found
     candidates = [model_name]
     if "gemini" in model_name:
-        for fallback in ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]:
+        for fallback in ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.5-flash"]:
             if fallback not in candidates:
                 candidates.append(fallback)
 
     last_error = None
     for cand_model in candidates:
-        try:
-            log.info("Attempting LLM completion with model: %s", cand_model)
-            response = client.chat.completions.create(
-                model=cand_model,
-                temperature=0.3,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-            )
-            content = response.choices[0].message.content
-            if content and len(content.strip()) > 50:
-                log.info("LLM completion succeeded with model: %s", cand_model)
-                return content.strip()
-        except Exception as exc:
-            last_error = exc
-            log.warning("Model '%s' failed: %s: %s", cand_model, type(exc).__name__, exc)
-            # Only abort if authentication itself failed (401 invalid api key)
-            err_str = str(exc).lower()
-            if "401" in err_str or "invalid_api_key" in err_str or "unauthenticated" in err_str:
-                log.error("Authentication failed. Aborting model retries.")
-                break
-            # Otherwise continue trying remaining candidate models
+        model_failed = False
+        for attempt in range(3):
+            try:
+                log.info("Attempting LLM completion with model: %s (attempt %d/3)", cand_model, attempt + 1)
+                response = client.chat.completions.create(
+                    model=cand_model,
+                    temperature=0.3,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": prompt},
+                    ],
+                )
+                content = response.choices[0].message.content
+                if content and len(content.strip()) > 50:
+                    log.info("LLM completion succeeded with model: %s", cand_model)
+                    return content.strip()
+            except Exception as exc:
+                last_error = exc
+                err_str = str(exc).lower()
+                log.warning("Model '%s' attempt %d failed: %s: %s", cand_model, attempt + 1, type(exc).__name__, exc)
+                
+                # If authentication failed, abort immediately
+                if "401" in err_str or "invalid_api_key" in err_str or "unauthenticated" in err_str:
+                    log.error("Authentication failed. Aborting model retries.")
+                    model_failed = True
+                    break
+                    
+                # If model not found or retired, stop retrying this model and switch to next
+                if "404" in err_str or "not found" in err_str or "no longer available" in err_str:
+                    model_failed = True
+                    break
+                    
+                # If server is overloaded (503) or rate limited (429), wait and retry
+                if ("503" in err_str or "unavailable" in err_str or "high demand" in err_str or "429" in err_str) and attempt < 2:
+                    wait_sec = 4 * (attempt + 1)
+                    log.info("Google Gemini server busy (503/429), waiting %d seconds before retry...", wait_sec)
+                    time.sleep(wait_sec)
+                    continue
 
-
+        if "401" in str(last_error).lower() or "invalid_api_key" in str(last_error).lower():
+            break
 
     err_msg = f"大模型调用失败: {type(last_error).__name__}: {last_error}"
     log.error("%s. Falling back to structured list.", err_msg)
     errors.append(err_msg)
     return generate_fallback_report(articles_by_source, errors)
+
 
