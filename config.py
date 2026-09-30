@@ -74,7 +74,7 @@ class AppConfig:
 
         # Dedicated or smart-detected Gemini configuration
         gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
-        if not gemini_key and (openai_key.startswith("AIzaSy") or "googleapis.com" in openai_base):
+        if not gemini_key and (openai_key.startswith("AIza") or openai_key.startswith("AQ.") or "googleapis.com" in openai_base):
             gemini_key = openai_key
 
         gemini_base = os.getenv("GEMINI_BASE_URL", "").strip() or (
@@ -86,8 +86,9 @@ class AppConfig:
 
         # Dedicated or smart-detected DeepSeek configuration
         deepseek_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
-        if not deepseek_key and (openai_key.startswith("sk-") and not openai_key.startswith("AIzaSy")):
+        if not deepseek_key and (openai_key.startswith("sk-") and not openai_key.startswith("AIza") and not openai_key.startswith("AQ.")):
             deepseek_key = openai_key
+
 
         deepseek_base = os.getenv("DEEPSEEK_BASE_URL", "").strip() or (
             openai_base if "deepseek" in openai_base else "https://api.deepseek.com/v1"
