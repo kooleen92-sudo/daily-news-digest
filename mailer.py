@@ -80,6 +80,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .badge-wsj {{ background: #eff6ff; color: #1d4ed8; border: 1px solid #93c5fd; }}
   .badge-ft {{ background: #fdf2f8; color: #be185d; border: 1px solid #fbcfe8; }}
   .badge-zaobao {{ background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; }}
+  .badge-nikkei {{ background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }}
+  .badge-economist {{ background: #fff7ed; color: #c2410c; border: 1px solid #fed7aa; }}
 
   .content {{
     padding: 30px 28px;
@@ -182,6 +184,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <span class="badge badge-wsj">华尔街日报 WSJ</span>
     <span class="badge badge-ft">金融时报 FT</span>
     <span class="badge badge-zaobao">联合早报 Zaobao</span>
+    <span class="badge badge-nikkei">日经中文网 Nikkei</span>
+    <span class="badge badge-economist">经济学人 Economist</span>
   </div>
   <div class="content">
     {body_html}
@@ -235,7 +239,7 @@ def send_digest_email(body_markdown: str, errors: list[str]) -> None:
     tz = ZoneInfo(config.digest_timezone)
     now = datetime.now(tz)
     date_str = now.strftime("%Y-%m-%d")
-    subject = f"【财经与中国深度简报】{date_str} - 彭博社/路透社/华尔街日报/金融时报/联合早报"
+    subject = f"【财经与中国深度简报】{date_str} - 全球七大权威媒体精要与资产配置指引"
 
     html_content = render_html_document(body_markdown, errors)
 

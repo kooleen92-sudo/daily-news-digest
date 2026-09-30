@@ -7,12 +7,14 @@ Target media:
 3. 华尔街日报 (Wall Street Journal / WSJ)
 4. 金融时报 (Financial Times / FT)
 5. 联合早报 (Lianhe Zaobao)
+6. 日经中文网 (Nikkei Chinese / Nikkei Asia)
+7. 经济学人 (The Economist)
 
 Usage:
   python main.py --dry-run        # Extract, analyze, and save preview to output/ without sending email
   python main.py --run-now        # Extract, analyze, and immediately send to email
   python main.py --schedule       # Run as a background daemon scheduled daily at 08:00 AM
-  python main.py --test-sources   # Check connectivity and articles count for each of the 5 sources
+  python main.py --test-sources   # Check connectivity and articles count for each of the 7 sources
   python main.py --test-mail      # Test SMTP settings by sending a quick test email
 """
 
@@ -58,8 +60,8 @@ def execute_digest(*, dry_run: bool = False) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1. 抓取五大权威外媒
-    log.info("正在抓取五大外媒（彭博社、路透社、华尔街日报、金融时报、联合早报）过去 %d 小时新闻...", config.lookback_hours)
+    # 1. 抓取七大权威外媒
+    log.info("正在抓取七大外媒（彭博社、路透社、华尔街日报、金融时报、联合早报、日经中文网、经济学人）过去 %d 小时新闻...", config.lookback_hours)
     articles_by_source, errors = collect_all_sources(
         lookback_hours=config.lookback_hours,
         max_per_source=config.max_items_per_source
@@ -129,16 +131,16 @@ def main() -> None:
     parser.add_argument("--run-now", action="store_true", help="立即执行抓取、总结并发起邮件发送")
     parser.add_argument("--dry-run", action="store_true", help="立即执行抓取和总结，生成本地 HTML/MD 预览，不发邮件")
     parser.add_argument("--schedule", action="store_true", help="以常驻进程模式启动内置定时任务调度器（默认每天08:00）")
-    parser.add_argument("--test-sources", action="store_true", help="仅测试五大外媒的数据源连接与抓取能力")
+    parser.add_argument("--test-sources", action="store_true", help="仅测试七大外媒的数据源连接与抓取能力")
     parser.add_argument("--test-mail", action="store_true", help="测试 SMTP 邮件连接并发送一封测试邮件")
 
     args = parser.parse_args()
 
     if args.test_sources:
-        log.info("正在测试五大外媒连接...")
+        log.info("正在测试七大权威外媒连接...")
         articles_by_source, errors = collect_all_sources(lookback_hours=24, max_per_source=3)
         print("\n" + "="*50)
-        print("五大权威外媒连接测试结果：")
+        print("七大权威外媒连接测试结果：")
         print("="*50)
         for src, items in articles_by_source.items():
             status = "✅ 正常" if items else "❌ 暂无条目"
@@ -160,7 +162,7 @@ def main() -> None:
             test_content = (
                 "## 这是一个测试邮件\n\n"
                 "您的每日财经与中国深度简报服务邮件配置已生效！\n\n"
-                "- 目标关注媒体：彭博社、路透社、华尔街日报、金融时报、联合早报\n"
+                "- 目标关注媒体：彭博社、路透社、华尔街日报、金融时报、联合早报、日经中文网、经济学人\n"
                 f"- 定时时间：每天早晨 {config.digest_time} ({config.digest_timezone})\n"
             )
             try:

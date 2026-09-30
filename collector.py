@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-News collector for the 5 targeted media outlets:
+News collector for the 7 targeted media outlets:
 1. 彭博社 (Bloomberg)
 2. 路透社 (Reuters)
 3. 华尔街日报 (The Wall Street Journal / WSJ)
 4. 金融时报 (Financial Times / FT)
 5. 联合早报 (Lianhe Zaobao)
+6. 日经中文网 (Nikkei Chinese / Nikkei Asia)
+7. 经济学人 (The Economist)
 
 Focusing on:
 - Financial & Macroeconomic news (财经消息)
@@ -140,9 +142,15 @@ def fetch_rss_feed(
     try:
         content = http_get(url)
         parsed = feedparser.parse(content)
-        
         for entry in parsed.entries:
             title = clean_text(entry.get("title", ""), 250)
+            # Remove publisher suffix from Google News RSS titles
+            title = re.sub(
+                r"\s*[-–|]\s*(日经中文网|The Economist|Bloomberg|Reuters|WSJ|Financial Times|联合早报).*$",
+                "",
+                title,
+                flags=re.IGNORECASE
+            ).strip()
             link = str(entry.get("link", "")).strip()
             summary = clean_text(entry.get("summary") or entry.get("description") or "", 800)
             
@@ -287,12 +295,14 @@ def deduplicate_articles(articles: list[NewsArticle], similarity_threshold: floa
 
 def collect_all_sources(lookback_hours: int = 24, max_per_source: int = 6) -> tuple[dict[str, list[NewsArticle]], list[str]]:
     """
-    Collect news from all 5 media outlets:
+    Collect news from all 7 media outlets:
     - 彭博社 (Bloomberg)
     - 路透社 (Reuters)
     - 华尔街日报 (Wall Street Journal / WSJ)
     - 金融时报 (Financial Times / FT)
     - 联合早报 (Lianhe Zaobao)
+    - 日经中文网 (Nikkei Chinese / Nikkei Asia)
+    - 经济学人 (The Economist)
 
     Returns:
         (results_by_source, error_messages)
@@ -303,6 +313,8 @@ def collect_all_sources(lookback_hours: int = 24, max_per_source: int = 6) -> tu
         "华尔街日报": [],
         "金融时报": [],
         "联合早报": [],
+        "日经中文网": [],
+        "经济学人": [],
     }
     errors: list[str] = []
 
@@ -459,5 +471,87 @@ def collect_all_sources(lookback_hours: int = 24, max_per_source: int = 6) -> tu
         results["联合早报"] = deduplicate_articles(zaobao_items)[:max_per_source]
     else:
         errors.append("联合早报：未能成功拉取更新")
+
+    # 6. 日经中文网 (Nikkei Chinese / Nikkei Asia)
+    nikkei_items = []
+    try:
+        nikkei_target = fetch_rss_feed(
+            "日经中文网",
+            "https://news.google.com/rss/search?q=site:cn.nikkei.com+(%E4%B8%AD%E5%9B%BD+OR+%E7%BB%8F%E6%B5%8E+OR+%E5%8D%8A%E5%AF%BC%E4%BD%93+OR+%E6%97%A5%E5%85%83+OR+%E5%B8%82%E5%9C%BA+OR+%E4%BA%A7%E4%B8%9A)&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
+            lookback_hours=lookback_hours,
+            max_items=max_per_source,
+            force_relevant=False,
+        )
+        nikkei_items.extend(nikkei_target)
+    except Exception as e:
+        log.warning("Nikkei targeted GNews RSS error: %s", e)
+
+    if len(nikkei_items) < max_per_source:
+        try:
+            nikkei_gen = fetch_rss_feed(
+                "日经中文网",
+                "https://news.google.com/rss/search?q=site:cn.nikkei.com&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
+                lookback_hours=lookback_hours,
+                max_items=max_per_source,
+                force_relevant=True,
+            )
+            nikkei_items.extend(nikkei_gen)
+        except Exception as e:
+            log.warning("Nikkei general GNews RSS error: %s", e)
+
+    if nikkei_items:
+        results["日经中文网"] = deduplicate_articles(nikkei_items)[:max_per_source]
+    else:
+        errors.append("日经中文网：未能成功拉取更新")
+
+    # 7. 经济学人 (The Economist)
+    economist_items = []
+    # 经济学人以长周期、深度宏观分析为主，适当放宽回溯时间窗口以锁定高含金量专栏
+    econ_lookback = max(lookback_hours, 48)
+
+    # 7.1 官方财经与宏观专栏 RSS
+    try:
+        econ_fin = fetch_rss_feed(
+            "经济学人",
+            "https://www.economist.com/finance-and-economics/rss.xml",
+            lookback_hours=econ_lookback,
+            max_items=max_per_source,
+            force_relevant=False,
+        )
+        economist_items.extend(econ_fin)
+    except Exception as e:
+        log.warning("The Economist Finance RSS error: %s", e)
+
+    # 7.2 官方中国专栏 RSS
+    try:
+        econ_china = fetch_rss_feed(
+            "经济学人",
+            "https://www.economist.com/china/rss.xml",
+            lookback_hours=econ_lookback,
+            max_items=max_per_source,
+            force_relevant=False,
+        )
+        economist_items.extend(econ_china)
+    except Exception as e:
+        log.warning("The Economist China RSS error: %s", e)
+
+    # 7.3 Google News 宏观与中国补充流
+    if len(economist_items) < max_per_source:
+        try:
+            econ_gnews = fetch_rss_feed(
+                "经济学人",
+                "https://news.google.com/rss/search?q=site:economist.com+(China+OR+economy+OR+markets+OR+finance+OR+Fed)&hl=en-US&gl=US&ceid=US:en",
+                lookback_hours=econ_lookback,
+                max_items=max_per_source,
+                force_relevant=True,
+            )
+            economist_items.extend(econ_gnews)
+        except Exception as e:
+            log.warning("The Economist GNews RSS error: %s", e)
+
+    if economist_items:
+        results["经济学人"] = deduplicate_articles(economist_items)[:max_per_source]
+    else:
+        errors.append("经济学人：未能成功拉取更新")
 
     return results, errors
