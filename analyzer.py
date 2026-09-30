@@ -128,55 +128,39 @@ def generate_fallback_report(articles_by_source: dict[str, list[NewsArticle]], e
     return "\n".join(lines)
 
 
-def analyze_news(articles_by_source: dict[str, list[NewsArticle]], errors: list[str]) -> str:
-    """
-    Generate deep impact analysis using OpenAI-compatible LLM.
-    Falls back gracefully if LLM is not configured or fails.
-    """
-    total_articles = sum(len(items) for items in articles_by_source.values())
-    if total_articles == 0:
-        return "## 暂无新闻\n\n过去 24 小时未抓取到符合条件的财经及中国大陆新闻。"
+def _call_llm_provider(
+    provider_name: str,
+    api_key: str,
+    base_url: str | None,
+    candidate_models: list[str],
+    prompt: str,
+) -> tuple[str | None, Exception | None]:
+    """Execute LLM call across a list of candidate models with exponential retry."""
+    if not api_key:
+        return None, ValueError(f"{provider_name} API Key 未配置")
 
-    if not config.openai_api_key:
-        log.info("OPENAI_API_KEY is not configured. Using structured fallback report.")
-        return generate_fallback_report(articles_by_source, errors)
-
-    # Clean inputs
-    model_name = config.llm_model.strip().lower().replace(" ", "-")
-    base_url = config.openai_base_url.strip() if config.openai_base_url else None
-    
-    # If base_url is google generative language, ensure correct OpenAI endpoint structure
+    # Normalize base_url
     if base_url and "googleapis.com" in base_url and not base_url.endswith("/openai/"):
         base_url = base_url.rstrip("/") + "/openai/"
 
-    log.info("Requesting LLM analysis via model '%s' (base_url: %s)...", model_name, base_url)
-    articles_text = format_articles_for_prompt(articles_by_source)
-    prompt = USER_PROMPT_TEMPLATE.format(articles_text=articles_text)
-
     client_kwargs = {
-        "api_key": config.openai_api_key.strip(),
+        "api_key": api_key.strip(),
         "timeout": config.llm_timeout,
         "max_retries": 1,
     }
     if base_url:
-        client_kwargs["base_url"] = base_url
+        client_kwargs["base_url"] = base_url.strip()
 
     client = OpenAI(**client_kwargs)
+    last_error: Exception | None = None
 
-    # Candidate models to try if the primary model is retired or not found
-    candidates = [model_name]
-    if "gemini" in model_name:
-        for fallback in ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.5-flash"]:
-            if fallback not in candidates:
-                candidates.append(fallback)
-
-    last_error = None
-    for cand_model in candidates:
-        model_failed = False
+    for cand_model in candidate_models:
+        clean_model = cand_model.strip().lower().replace(" ", "-")
         for attempt in range(3):
             try:
+                log.info("[%s] 正在调用模型: %s (第 %d/3 次尝试)...", provider_name, clean_model, attempt + 1)
                 create_kwargs = {
-                    "model": cand_model,
+                    "model": clean_model,
                     "temperature": 0.3,
                     "max_tokens": 8192,
                     "messages": [
@@ -187,37 +171,98 @@ def analyze_news(articles_by_source: dict[str, list[NewsArticle]], errors: list[
                 response = client.chat.completions.create(**create_kwargs)
                 content = response.choices[0].message.content
                 if content and len(content.strip()) > 50:
-                    log.info("LLM completion succeeded with model: %s", cand_model)
-                    return content.strip()
+                    log.info("[%s] 成功生成分析报告！模型: %s", provider_name, clean_model)
+                    return content.strip(), None
             except Exception as exc:
                 last_error = exc
                 err_str = str(exc).lower()
-                log.warning("Model '%s' attempt %d failed: %s: %s", cand_model, attempt + 1, type(exc).__name__, exc)
-                
+                log.warning("[%s] 模型 '%s' 第 %d 次尝试未成功: %s: %s", provider_name, clean_model, attempt + 1, type(exc).__name__, exc)
+
                 # If authentication failed, abort immediately
                 if "401" in err_str or "invalid_api_key" in err_str or "unauthenticated" in err_str:
-                    log.error("Authentication failed. Aborting model retries.")
-                    model_failed = True
-                    break
-                    
-                # If model not found or retired, stop retrying this model and switch to next
+                    log.error("[%s] 鉴权失败，终止该厂商重试。", provider_name)
+                    return None, last_error
+
+                # If model is retired or not found, switch immediately to next candidate
                 if "404" in err_str or "not found" in err_str or "no longer available" in err_str:
-                    model_failed = True
                     break
-                    
-                # If server is overloaded (503) or rate limited (429), wait and retry
+
+                # If 503 (high demand) or 429 (rate limit), wait and retry
                 if ("503" in err_str or "unavailable" in err_str or "high demand" in err_str or "429" in err_str) and attempt < 2:
                     wait_sec = 4 * (attempt + 1)
-                    log.info("Google Gemini server busy (503/429), waiting %d seconds before retry...", wait_sec)
+                    log.info("[%s] 节点繁忙（503/429），暂停 %d 秒后进行重试...", provider_name, wait_sec)
                     time.sleep(wait_sec)
                     continue
 
-        if "401" in str(last_error).lower() or "invalid_api_key" in str(last_error).lower():
-            break
+    return None, last_error
 
-    err_msg = f"大模型调用失败: {type(last_error).__name__}: {last_error}"
-    log.error("%s. Falling back to structured list.", err_msg)
-    errors.append(err_msg)
+
+def analyze_news(articles_by_source: dict[str, list[NewsArticle]], errors: list[str]) -> str:
+    """
+    Generate deep impact analysis with two-tier prioritized architecture:
+    1. Priority 1: Google Gemini (latest pro/flash models)
+    2. Priority 2: DeepSeek (failsafe failover if Gemini is overloaded or fails)
+    3. Priority 3: Structured news list fallback (if both fail or are unconfigured)
+    """
+    total_articles = sum(len(items) for items in articles_by_source.values())
+    if total_articles == 0:
+        return "## 暂无新闻\n\n过去 24 小时未抓取到符合条件的财经及中国大陆新闻。"
+
+    articles_text = format_articles_for_prompt(articles_by_source)
+    prompt = USER_PROMPT_TEMPLATE.format(articles_text=articles_text)
+
+    # -------------------------------------------------------------
+    # Tier 1: 优先尝试 Google Gemini
+    # -------------------------------------------------------------
+    if config.gemini_api_key:
+        log.info("【Tier 1】优先使用 Google Gemini 引擎进行深度分析...")
+        # Candidates list: configured model first, followed by Gemini 3 flash variants
+        gemini_candidates = [config.gemini_model]
+        for fallback in ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.5-flash"]:
+            if fallback not in gemini_candidates:
+                gemini_candidates.append(fallback)
+
+        content, gemini_err = _call_llm_provider(
+            provider_name="Google Gemini",
+            api_key=config.gemini_api_key,
+            base_url=config.gemini_base_url,
+            candidate_models=gemini_candidates,
+            prompt=prompt,
+        )
+        if content:
+            footer_note = f"\n\n---\n*🤖 本期研报由 Google Gemini 旗舰引擎分析生成*"
+            return content + footer_note
+        else:
+            warn_msg = f"Gemini 尝试失败: {type(gemini_err).__name__}: {gemini_err}"
+            log.warning("%s。准备无缝切换至 DeepSeek 容灾备份...", warn_msg)
+            errors.append(warn_msg)
+
+    # -------------------------------------------------------------
+    # Tier 2: 容灾备份：调用 DeepSeek
+    # -------------------------------------------------------------
+    if config.deepseek_api_key:
+        log.info("【Tier 2】触发容灾切换：使用 DeepSeek 引擎进行深度分析...")
+        deepseek_candidates = [config.deepseek_model, "deepseek-chat"]
+        content, ds_err = _call_llm_provider(
+            provider_name="DeepSeek",
+            api_key=config.deepseek_api_key,
+            base_url=config.deepseek_base_url,
+            candidate_models=deepseek_candidates,
+            prompt=prompt,
+        )
+        if content:
+            footer_note = f"\n\n---\n*🤖 本期研报由 DeepSeek 智能引擎分析生成（Gemini 节点繁忙自动容灾切换）*"
+            return content + footer_note
+        else:
+            warn_msg = f"DeepSeek 尝试失败: {type(ds_err).__name__}: {ds_err}"
+            log.error("%s", warn_msg)
+            errors.append(warn_msg)
+
+    # -------------------------------------------------------------
+    # Tier 3: 最终兜底排版（无大模型或全部超时报错）
+    # -------------------------------------------------------------
+    log.warning("所有大模型均未配置或调用失败，使用结构化新闻列表兜底排版。")
     return generate_fallback_report(articles_by_source, errors)
+
 
 

@@ -30,11 +30,21 @@ class AppConfig:
     fetch_timeout: float = 15.0
     dedupe_similarity: float = 0.85
 
-    # LLM Settings
+    # Legacy / General LLM Settings
     openai_api_key: str = ""
     openai_base_url: str = ""
     llm_model: str = "gpt-4o-mini"
     llm_timeout: float = 90.0
+
+    # Dedicated Gemini Settings (Priority 1)
+    gemini_api_key: str = ""
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    gemini_model: str = "gemini-3.8-flash"
+
+    # Dedicated DeepSeek Settings (Priority 2 / Fallback)
+    deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
+    deepseek_model: str = "deepseek-chat"
 
     # Email Settings
     mail_to: str = ""
@@ -55,9 +65,36 @@ class AppConfig:
             return val in {"1", "true", "yes", "on"}
 
         smtp_port = int(os.getenv("SMTP_PORT", "465"))
-        # Default SSL for port 465, TLS for 587
         default_ssl = (smtp_port == 465)
         default_tls = (smtp_port == 587)
+
+        openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+        openai_base = os.getenv("OPENAI_BASE_URL", "").strip()
+        openai_model = os.getenv("LLM_MODEL", "").strip()
+
+        # Dedicated or smart-detected Gemini configuration
+        gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+        if not gemini_key and (openai_key.startswith("AIzaSy") or "googleapis.com" in openai_base):
+            gemini_key = openai_key
+
+        gemini_base = os.getenv("GEMINI_BASE_URL", "").strip() or (
+            openai_base if "googleapis.com" in openai_base else "https://generativelanguage.googleapis.com/v1beta/openai/"
+        )
+        gemini_model = os.getenv("GEMINI_MODEL", "").strip() or (
+            openai_model if "gemini" in openai_model.lower() else "gemini-3.8-flash"
+        )
+
+        # Dedicated or smart-detected DeepSeek configuration
+        deepseek_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+        if not deepseek_key and (openai_key.startswith("sk-") and not openai_key.startswith("AIzaSy")):
+            deepseek_key = openai_key
+
+        deepseek_base = os.getenv("DEEPSEEK_BASE_URL", "").strip() or (
+            openai_base if "deepseek" in openai_base else "https://api.deepseek.com/v1"
+        )
+        deepseek_model = os.getenv("DEEPSEEK_MODEL", "").strip() or (
+            openai_model if "deepseek" in openai_model.lower() else "deepseek-chat"
+        )
 
         return cls(
             digest_time=os.getenv("DIGEST_TIME", "08:00").strip(),
@@ -66,10 +103,16 @@ class AppConfig:
             max_items_per_source=int(os.getenv("MAX_ITEMS_PER_SOURCE", "5")),
             fetch_timeout=float(os.getenv("FETCH_TIMEOUT", "15.0")),
             dedupe_similarity=float(os.getenv("DEDUPE_SIMILARITY", "0.85")),
-            openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
-            openai_base_url=os.getenv("OPENAI_BASE_URL", "").strip(),
-            llm_model=os.getenv("LLM_MODEL", "gpt-4o-mini").strip(),
+            openai_api_key=openai_key,
+            openai_base_url=openai_base,
+            llm_model=openai_model or "deepseek-chat",
             llm_timeout=float(os.getenv("LLM_TIMEOUT", "90.0")),
+            gemini_api_key=gemini_key,
+            gemini_base_url=gemini_base,
+            gemini_model=gemini_model,
+            deepseek_api_key=deepseek_key,
+            deepseek_base_url=deepseek_base,
+            deepseek_model=deepseek_model,
             mail_to=os.getenv("MAIL_TO", "").strip(),
             mail_from=os.getenv("MAIL_FROM", "").strip() or os.getenv("SMTP_USER", "").strip(),
             smtp_host=os.getenv("SMTP_HOST", "").strip(),
@@ -82,3 +125,4 @@ class AppConfig:
 
 
 config = AppConfig.load()
+
