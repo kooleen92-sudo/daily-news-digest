@@ -474,11 +474,13 @@ def collect_all_sources(lookback_hours: int = 24, max_per_source: int = 6) -> tu
 
     # 6. 日经中文网 (Nikkei Chinese / Nikkei Asia)
     nikkei_items = []
+    # 针对节假日/周末及深度专栏，动态放宽回溯窗口至 48 小时，确保稳定拉取
+    nikkei_lookback = max(lookback_hours, 48)
     try:
         nikkei_target = fetch_rss_feed(
             "日经中文网",
             "https://news.google.com/rss/search?q=site:cn.nikkei.com+(%E4%B8%AD%E5%9B%BD+OR+%E7%BB%8F%E6%B5%8E+OR+%E5%8D%8A%E5%AF%BC%E4%BD%93+OR+%E6%97%A5%E5%85%83+OR+%E5%B8%82%E5%9C%BA+OR+%E4%BA%A7%E4%B8%9A)&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
-            lookback_hours=lookback_hours,
+            lookback_hours=nikkei_lookback,
             max_items=max_per_source,
             force_relevant=False,
         )
@@ -491,7 +493,7 @@ def collect_all_sources(lookback_hours: int = 24, max_per_source: int = 6) -> tu
             nikkei_gen = fetch_rss_feed(
                 "日经中文网",
                 "https://news.google.com/rss/search?q=site:cn.nikkei.com&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
-                lookback_hours=lookback_hours,
+                lookback_hours=nikkei_lookback,
                 max_items=max_per_source,
                 force_relevant=True,
             )
