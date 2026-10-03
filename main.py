@@ -39,6 +39,7 @@ from config import config
 from collector import collect_all_sources
 from analyzer import analyze_news
 from mailer import send_digest_email, render_html_document, test_smtp_connection
+from image_generator import generate_digest_image
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 LOGS_DIR = Path(__file__).resolve().parent / "logs"
@@ -78,26 +79,32 @@ def execute_digest(*, dry_run: bool = False) -> None:
     log.info("正在生成财经与中国宏观深度分析报告...")
     report_markdown = analyze_news(articles_by_source, errors)
 
-    # 3. 本地存储预览备份
+    # 3. 本地存储预览备份与高清长图生成
     now = datetime.now(ZoneInfo(config.digest_timezone))
     date_tag = now.strftime("%Y%m%d")
     md_file = OUTPUT_DIR / f"digest_{date_tag}.md"
     html_file = OUTPUT_DIR / f"digest_{date_tag}.html"
+    img_file = OUTPUT_DIR / f"digest_{date_tag}.png"
     
     html_content = render_html_document(report_markdown, errors)
     md_file.write_text(report_markdown, encoding="utf-8")
     html_file.write_text(html_content, encoding="utf-8")
-    log.info("已生成本地预览文件：\n  - Markdown: %s\n  - HTML: %s", md_file, html_file)
+
+    # 渲染高清长图 (2x Retina 高清分辨率)
+    long_image_path = generate_digest_image(html_file, img_file)
+
+    log.info("已生成本地文件：\n  - Markdown: %s\n  - HTML: %s\n  - Long Image: %s",
+             md_file, html_file, long_image_path or "(未生成)")
 
     # 4. 邮件发送
     if dry_run:
-        log.info("[Dry Run 模式] 本次执行仅生成预览，不发送邮件。")
+        log.info("[Dry Run 模式] 本次执行仅生成预览与长图，不发送邮件。")
         log.info("报告字数：%d，耗时：%.1f 秒", len(report_markdown), time.perf_counter() - started_at)
         return
 
-    log.info("正在向目标邮箱 [%s] 发送简报邮件...", config.mail_to)
+    log.info("正在向目标邮箱 [%s] 发送简报邮件（含高清长图附件）...", config.mail_to)
     try:
-        send_digest_email(report_markdown, errors)
+        send_digest_email(report_markdown, errors, image_path=long_image_path)
         log.info("========== 简报任务成功完成！总耗时: %.1f 秒 ==========", time.perf_counter() - started_at)
     except Exception as exc:
         log.error("邮件发送失败: %s: %s", type(exc).__name__, exc)

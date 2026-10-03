@@ -11,6 +11,7 @@ import smtplib
 from email.message import EmailMessage
 from email.utils import format_datetime
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 import markdown
 
@@ -192,8 +193,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     {warnings_html}
   </div>
   <div class="footer">
-    <p>本简报由定时任务自动聚合分析海外权威外媒财经与中国要闻生成，仅供参考。</p>
-    <p>请点击原文链接核实详细报道。附件中附带完整 Markdown 文档可存档阅读。</p>
+    <p>📱 <strong>手机阅读体验提示</strong>：邮件附件中已附带<strong>高清长图（PNG）</strong>与 Markdown 报告源文件，手机端可长按保存至相册并转发分享。</p>
+    <p>本简报由定时任务自动聚合分析海外权威外媒财经与中国要闻生成，仅供参考，请点击原文链接核实详细报道。</p>
   </div>
 </div>
 </body>
@@ -229,7 +230,7 @@ def render_html_document(body_markdown: str, errors: list[str]) -> str:
     return html
 
 
-def send_digest_email(body_markdown: str, errors: list[str]) -> None:
+def send_digest_email(body_markdown: str, errors: list[str], image_path: Path | None = None) -> None:
     """Build and send digest email via configured SMTP server."""
     if not config.mail_to:
         raise ValueError("MAIL_TO 未配置，无法发送邮件。请在 .env 中设置 MAIL_TO=收件邮箱")
@@ -253,6 +254,22 @@ def send_digest_email(body_markdown: str, errors: list[str]) -> None:
     message.set_content(body_markdown)
     # HTML alternative
     message.add_alternative(html_content, subtype="html")
+
+    # Add .png long image attachment if available
+    if image_path and Path(image_path).exists():
+        img_path = Path(image_path)
+        img_filename = f"finance_china_digest_{date_str}.png"
+        try:
+            img_bytes = img_path.read_bytes()
+            message.add_attachment(
+                img_bytes,
+                maintype="image",
+                subtype="png",
+                filename=img_filename
+            )
+            log.info("已将高清长图 [%s] 添加至邮件附件", img_filename)
+        except Exception as e:
+            log.warning("添加长图附件失败: %s", e)
 
     # Add .md attachment
     filename = f"finance_china_digest_{date_str}.md"

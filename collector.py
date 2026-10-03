@@ -474,8 +474,8 @@ def collect_all_sources(lookback_hours: int = 24, max_per_source: int = 6) -> tu
 
     # 6. 日经中文网 (Nikkei Chinese / Nikkei Asia)
     nikkei_items = []
-    # 针对节假日/周末及深度专栏，动态放宽回溯窗口至 48 小时，确保稳定拉取
-    nikkei_lookback = max(lookback_hours, 48)
+    # 针对节假日/周末（如黄金周多日休假）及深度专栏，放宽回溯窗口至 96 小时（4天），确保稳定拉取
+    nikkei_lookback = max(lookback_hours, 96)
     try:
         nikkei_target = fetch_rss_feed(
             "日经中文网",
@@ -508,8 +508,8 @@ def collect_all_sources(lookback_hours: int = 24, max_per_source: int = 6) -> tu
 
     # 7. 经济学人 (The Economist)
     economist_items = []
-    # 经济学人以长周期、深度宏观分析为主，适当放宽回溯时间窗口以锁定高含金量专栏
-    econ_lookback = max(lookback_hours, 48)
+    # 经济学人以长周期、深度宏观分析为主，放宽回溯时间窗口以锁定高含金量专栏
+    econ_lookback = max(lookback_hours, 96)
 
     # 7.1 官方财经与宏观专栏 RSS
     try:
