@@ -193,7 +193,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     {warnings_html}
   </div>
   <div class="footer">
-    <p>📱 <strong>手机阅读体验提示</strong>：邮件附件中已附带<strong>高清长图（PNG）</strong>与 Markdown 报告源文件，手机端可长按保存至相册并转发分享。</p>
+    <p>📱 <strong>手机阅读体验提示</strong>：邮件附件中已附带<strong>高清长图（PNG）</strong>，手机端可长按保存至相册并转发分享。</p>
     <p>本简报由定时任务自动聚合分析海外权威外媒财经与中国要闻生成，仅供参考，请点击原文链接核实详细报道。</p>
   </div>
 </div>
@@ -251,14 +251,19 @@ def send_digest_email(body_markdown: str, errors: list[str], image_path: Path | 
     message["Date"] = format_datetime(now)
 
     # Plain text fallback
-    message.set_content(body_markdown)
+    plain_summary = (
+        f"【每日财经与中国宏观深度简报】({date_str})\n\n"
+        "请在支持 HTML 格式的邮件客户端中查阅完整图文分析与资产配置指引，"
+        "或长按/下载附件中的【高清长图】查看。\n"
+    )
+    message.set_content(plain_summary)
     # HTML alternative
     message.add_alternative(html_content, subtype="html")
 
-    # Add .png long image attachment if available
+    # Add .png long image attachment if available (only attachment, no .md)
+    img_filename = f"finance_china_digest_{date_str}.png"
     if image_path and Path(image_path).exists():
         img_path = Path(image_path)
-        img_filename = f"finance_china_digest_{date_str}.png"
         try:
             img_bytes = img_path.read_bytes()
             message.add_attachment(
@@ -271,30 +276,54 @@ def send_digest_email(body_markdown: str, errors: list[str], image_path: Path | 
         except Exception as e:
             log.warning("添加长图附件失败: %s", e)
 
-    # Add .md attachment
-    filename = f"finance_china_digest_{date_str}.md"
-    message.add_attachment(
-        body_markdown.encode("utf-8"),
-        maintype="text",
-        subtype="markdown",
-        filename=filename
-    )
+    def _do_send(msg: EmailMessage) -> None:
+        log.info("Connecting to SMTP server %s:%d (SSL=%s, TLS=%s)...",
+                 config.smtp_host, config.smtp_port, config.smtp_use_ssl, config.smtp_use_tls)
+        if config.smtp_use_ssl:
+            with smtplib.SMTP_SSL(config.smtp_host, config.smtp_port, timeout=30) as smtp:
+                if config.smtp_user and config.smtp_password:
+                    smtp.login(config.smtp_user, config.smtp_password)
+                smtp.send_message(msg)
+        else:
+            with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=30) as smtp:
+                if config.smtp_use_tls:
+                    smtp.starttls()
+                if config.smtp_user and config.smtp_password:
+                    smtp.login(config.smtp_user, config.smtp_password)
+                smtp.send_message(msg)
 
-    log.info("Connecting to SMTP server %s:%d (SSL=%s, TLS=%s)...",
-             config.smtp_host, config.smtp_port, config.smtp_use_ssl, config.smtp_use_tls)
+    try:
+        _do_send(message)
+    except smtplib.SMTPDataError as exc:
+        err_msg = str(exc)
+        if "550" in err_msg or "inappropriate" in err_msg.lower() or "content" in err_msg.lower():
+            log.warning("检测到邮件服务商文本内容拦截 (550)，正在自动降级为【精简正文 + 高清长图】模式重发...")
+            fallback_msg = EmailMessage()
+            fallback_msg["Subject"] = subject
+            fallback_msg["From"] = config.mail_from or config.smtp_user
+            fallback_msg["To"] = config.mail_to
+            fallback_msg["Date"] = format_datetime(now)
 
-    if config.smtp_use_ssl:
-        with smtplib.SMTP_SSL(config.smtp_host, config.smtp_port, timeout=30) as smtp:
-            if config.smtp_user and config.smtp_password:
-                smtp.login(config.smtp_user, config.smtp_password)
-            smtp.send_message(message)
-    else:
-        with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=30) as smtp:
-            if config.smtp_use_tls:
-                smtp.starttls()
-            if config.smtp_user and config.smtp_password:
-                smtp.login(config.smtp_user, config.smtp_password)
-            smtp.send_message(message)
+            clean_md = (
+                f"## 📋 每日财经与中国宏观深度简报 ({date_str})\n\n"
+                "> 💡 **查阅提示**：本期完整研报与资产配置建议已渲染为**高清长图（PNG）**附于邮件附件中，请长按或下载附件查看。\n\n"
+                f"- 附件已包含：**{img_filename}**（2x 视网膜超清长图）\n"
+            )
+            clean_html = render_html_document(clean_md, errors)
+            fallback_msg.set_content(plain_summary)
+            fallback_msg.add_alternative(clean_html, subtype="html")
+
+            if image_path and Path(image_path).exists():
+                fallback_msg.add_attachment(
+                    Path(image_path).read_bytes(),
+                    maintype="image",
+                    subtype="png",
+                    filename=img_filename
+                )
+            _do_send(fallback_msg)
+            log.info("【精简正文 + 高清长图】模式邮件已成功送达！")
+        else:
+            raise exc
 
     log.info("Email successfully sent to %s!", config.mail_to)
 
