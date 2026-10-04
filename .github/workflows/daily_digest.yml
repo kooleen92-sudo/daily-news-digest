@@ -2,9 +2,10 @@ name: Daily Finance & China News Digest
 
 on:
   schedule:
-    # 国际标准时间 UTC 23:50 对应北京时间 (UTC+8) 早上 07:50
-    # 完美处于 DeepSeek 谷时 5 折优惠时段内，且避开整点 08:00 排队，确保 8 点前准时收到
-    - cron: '50 23 * * *'
+    # 国际标准时间 UTC 23:35 对应北京时间 (UTC+8) 早上 07:35
+    # 完美处于 DeepSeek 谷时 5 折优惠时段内（18:00-09:00）
+    # 大幅避开 UTC 00:00 (北京时间 08:00) 全球定时任务高峰及 23:50 拥堵，确保 8 点前稳定送达
+    - cron: '35 23 * * *'
   workflow_dispatch: # 支持在 GitHub 页面上手动点击按钮立即测试触发
 
 
