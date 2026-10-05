@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 from typing import Union
+from config import config
 
 log = logging.getLogger("daily-news")
 

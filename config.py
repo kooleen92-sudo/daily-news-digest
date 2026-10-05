@@ -7,8 +7,11 @@ Reads settings from environment variables and .env file.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from dataclasses import dataclass
+from typing import Any
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -94,6 +97,50 @@ class AppConfig:
                     "candidates": [self.llm_model],
                 })
         return providers
+
+    def validate(self) -> list[str]:
+        """
+        Validate application configuration settings (Fail-Fast).
+        Returns a list of human-readable error messages. If empty, configuration is valid.
+        """
+        errors = []
+        # Validate DIGEST_TIME format (HH:MM)
+        if not re.match(r"^([01]\d|2[0-3]):([0-5]\d)$", self.digest_time):
+            errors.append(f"DIGEST_TIME '{self.digest_time}' 格式不合法，应为 HH:MM (如 '08:00')")
+
+        # Validate DIGEST_TIMEZONE
+        try:
+            ZoneInfo(self.digest_timezone)
+        except Exception:
+            errors.append(f"DIGEST_TIMEZONE '{self.digest_timezone}' 无效，应为标准 IANA 时区 (如 'Asia/Shanghai')")
+
+        # Validate numbers
+        if self.lookback_hours <= 0:
+            errors.append(f"LOOKBACK_HOURS '{self.lookback_hours}' 必须大于 0")
+        if self.max_items_per_source <= 0:
+            errors.append(f"MAX_ITEMS_PER_SOURCE '{self.max_items_per_source}' 必须大于 0")
+        if not (0.0 < self.dedupe_similarity <= 1.0):
+            errors.append(f"DEDUPE_SIMILARITY '{self.dedupe_similarity}' 必须在 0.0 到 1.0 之间")
+        if self.output_retention_days <= 0:
+            errors.append(f"OUTPUT_RETENTION_DAYS '{self.output_retention_days}' 必须大于 0")
+
+        # Validate LLM Providers
+        providers = self.get_configured_providers()
+        if not providers:
+            errors.append("未检测到任何可用的 AI 模型提供商配置 (请至少配置 GEMINI_API_KEY、DEEPSEEK_API_KEY 或 OPENAI_API_KEY)")
+
+        # Validate Email Settings (if mail_to is specified)
+        if self.mail_to:
+            if "@" not in self.mail_to:
+                errors.append(f"MAIL_TO '{self.mail_to}' 邮箱格式无效")
+            if not self.smtp_host:
+                errors.append("配置了 MAIL_TO，但未配置 SMTP_HOST")
+            if not (1 <= self.smtp_port <= 65535):
+                errors.append(f"SMTP_PORT '{self.smtp_port}' 端口超出合法范围 (1~65535)")
+            if self.smtp_use_ssl and self.smtp_use_tls:
+                errors.append("SMTP_USE_SSL 和 SMTP_USE_TLS 不能同时为 True，请根据端口选择其一 (465 通常为 SSL，587 通常为 TLS)")
+
+        return errors
 
     @classmethod
     def load(cls) -> "AppConfig":

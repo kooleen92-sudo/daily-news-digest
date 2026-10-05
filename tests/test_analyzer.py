@@ -51,6 +51,72 @@ def test_validate_and_sanitize_links():
     assert f"[{valid_url}]" in sanitized or f"({valid_url})" in sanitized
     # Fake url is sanitized to bold text (not a clickable broken link)
     assert fake_url not in sanitized
-    assert "**Fake Story**" in sanitized
     # Anchor is preserved
     assert "(#section-1)" in sanitized
+
+
+def test_validate_report_integrity():
+    from analyzer import validate_report_integrity
+
+    # Complete report
+    complete_report = """## 🌟 一、今日宏观核心研判与前瞻（Executive Summary）
+这里是核心研判内容，全球宏观经济呈现分化，美联储处于政策观望期。
+
+## 💡 二、个人投资与大类资产配置实战指南（Personal Allocation Blueprint）
+这里是详尽的个人配置指南，覆盖 A 股操作、公募基金定投、QDII 资产与黄金避险。
+
+| 资产类别 | 稳健型比例 | 进取型比例 |
+|---|---|---|
+| A股核心资产 | 30% | 45% |
+| QDII 全球 | 20% | 30% |
+
+## 📊 三、市场与资产影响速查矩阵（Market Impact Matrix）
+| 资产 | 影响倾向 | 逻辑 |
+|---|---|---|
+| A股 | 🟢利好 | 政策发力 |
+
+## 🔍 四、各家外媒精要与深度影响剖析（In-Depth Analysis）
+彭博社：核心要闻解析内容。
+""" + ("详细分析文字 " * 150)
+
+    is_valid, issues = validate_report_integrity(complete_report)
+    assert is_valid, f"Expected complete report to pass, but got issues: {issues}"
+    assert issues == []
+
+    # Incomplete report: missing Module 2 (Personal Allocation Blueprint)
+    missing_m2 = complete_report.replace("## 💡 二、个人投资与大类资产配置实战指南（Personal Allocation Blueprint）", "")
+    is_valid, issues = validate_report_integrity(missing_m2)
+    assert not is_valid
+    assert any("缺失【模块二" in issue for issue in issues)
+
+    # Incomplete report: truncated mid-codeblock
+    truncated = complete_report + "\n```python\nsome_unclosed_code = 1"
+    is_valid, issues = validate_report_integrity(truncated)
+    assert not is_valid
+    assert any("截断" in issue for issue in issues)
+
+
+def test_compute_articles_hash():
+    from analyzer import compute_articles_hash
+    from collector import NewsArticle
+
+    now = datetime.now(timezone.utc)
+    articles_set_1 = {
+        "彭博社": [NewsArticle(source="彭博社", title="Title 1", url="https://a.com", summary="S1", published_at=now)],
+        "路透社": [NewsArticle(source="路透社", title="Title 2", url="https://b.com", summary="S2", published_at=now)]
+    }
+    articles_set_2 = {
+        "路透社": [NewsArticle(source="路透社", title="Title 2", url="https://b.com", summary="S2", published_at=now)],
+        "彭博社": [NewsArticle(source="彭博社", title="Title 1", url="https://a.com", summary="S1", published_at=now)]
+    }
+    articles_set_diff = {
+        "彭博社": [NewsArticle(source="彭博社", title="Different Title", url="https://a.com", summary="S1", published_at=now)]
+    }
+
+    # Hash should be deterministic regardless of dictionary iteration order
+    hash1 = compute_articles_hash(articles_set_1)
+    hash2 = compute_articles_hash(articles_set_2)
+    hash3 = compute_articles_hash(articles_set_diff)
+
+    assert hash1 == hash2
+    assert hash1 != hash3

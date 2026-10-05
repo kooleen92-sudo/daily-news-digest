@@ -21,11 +21,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 import schedule
 
@@ -37,7 +39,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 from config import config
 from collector import collect_all_sources
-from analyzer import analyze_news
+from analyzer import analyze_news, validate_report_integrity
 from mailer import send_digest_email, render_html_document, test_smtp_connection
 from image_generator import generate_digest_image
 
@@ -74,6 +76,17 @@ def clean_old_outputs(retention_days: int = 7) -> None:
     if cleaned_count > 0:
         log.info("已自动清理 %d 个超过 %d 天的旧报告文件，释放空间: %.1f MB",
                  cleaned_count, retention_days, reclaimed_bytes / (1024 * 1024))
+
+
+def save_run_status(status_data: dict[str, Any]) -> None:
+    """Save structured execution status and diagnostics to output/status.json."""
+    status_file = OUTPUT_DIR / "status.json"
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        status_file.write_text(json.dumps(status_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        log.info("已更新运行诊断快照: %s", status_file)
+    except Exception as e:
+        log.debug("写入状态快照失败: %s", e)
 
 
 class SingleInstanceLock:
@@ -114,72 +127,119 @@ class SingleInstanceLock:
 
 def execute_digest(*, dry_run: bool = False) -> None:
     """Execute a complete news collection, analysis, and delivery cycle."""
+    # 0. 启动配置合法性强校验（Fail-Fast 机制）
+    cfg_errors = config.validate()
+    if cfg_errors:
+        for err in cfg_errors:
+            log.error("❌ 配置校验错误: %s", err)
+        if not dry_run:
+            raise ValueError(f"应用启动失败，配置存在以下错误 ({len(cfg_errors)} 项):\n" + "\n".join(f"- {e}" for e in cfg_errors))
+
     lock = SingleInstanceLock(OUTPUT_DIR.parent / ".daily_digest.lock")
     with lock as ok:
         if not ok:
             return
 
-        log.info("========== 开始执行每日财经与中国宏观简报任务 ==========")
+        run_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        start_ts = datetime.now(ZoneInfo(config.digest_timezone)).isoformat()
+        log.info("========== 开始执行每日财经与中国宏观简报任务 (ID: %s) ==========", run_id)
         started_at = time.perf_counter()
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-        # 启动日志：打印当前激活的 AI 引擎与模型链
-        providers = config.get_configured_providers()
-        p_desc = " -> ".join([f"{p['name']}({p['model']})" for p in providers]) if providers else "无（使用纯列表兜底）"
-        log.info("当前有效 AI 分析引擎链: %s", p_desc)
+        status_record: dict[str, Any] = {
+            "run_id": run_id,
+            "started_at": start_ts,
+            "dry_run": dry_run,
+            "overall_status": "RUNNING",
+            "sources_scraped": {},
+            "total_articles": 0,
+            "scraping_errors": [],
+            "report_validation": {},
+            "image_generated": False,
+            "image_size_kb": None,
+            "email_sent": False,
+            "duration_seconds": 0.0,
+        }
 
-        # 1. 抓取七大权威外媒（并发并行抓取）
-        log.info("正在并发抓取七大外媒（彭博社、路透社、华尔街日报、金融时报、联合早报、日经中文网、经济学人）...")
-        articles_by_source, errors = collect_all_sources(
-            lookback_hours=config.lookback_hours,
-            max_per_source=config.max_items_per_source
-        )
-        
-        total_articles = sum(len(v) for v in articles_by_source.values())
-        log.info("抓取完成！共获取 %d 篇有效报道：", total_articles)
-        for src, items in articles_by_source.items():
-            log.info("  * %s: %d 篇", src, len(items))
-        if errors:
-            log.warning("抓取遇到以下告警: %s", "；".join(errors))
-
-        # 2. 深度分析与影响剖析
-        log.info("正在生成财经与中国宏观深度分析报告...")
-        report_markdown = analyze_news(articles_by_source, errors)
-
-        # 3. 本地存储预览备份与高清长图生成
-        now = datetime.now(ZoneInfo(config.digest_timezone))
-        date_tag = now.strftime("%Y%m%d")
-        md_file = OUTPUT_DIR / f"digest_{date_tag}.md"
-        html_file = OUTPUT_DIR / f"digest_{date_tag}.html"
-        img_file = OUTPUT_DIR / f"digest_{date_tag}.png"
-        
-        html_content = render_html_document(report_markdown, errors)
-        md_file.write_text(report_markdown, encoding="utf-8")
-        html_file.write_text(html_content, encoding="utf-8")
-
-        # 渲染高清长图 (2x Retina 高清分辨率)
-        long_image_path = generate_digest_image(html_file, img_file)
-
-        log.info("已生成本地文件：\n  - Markdown: %s\n  - HTML: %s\n  - Long Image: %s",
-                 md_file, html_file, long_image_path or "(未生成)")
-
-        # 自动维护：清理过期旧输出
-        clean_old_outputs(config.output_retention_days)
-
-        # 4. 邮件发送
-        if dry_run:
-            log.info("[Dry Run 模式] 本次执行仅生成预览与长图，不发送邮件。")
-            log.info("报告字数：%d，耗时：%.1f 秒", len(report_markdown), time.perf_counter() - started_at)
-            return
-
-        log.info("正在向目标邮箱 [%s] 发送简报邮件（含高清长图附件）...", config.mail_to)
         try:
+            # 启动日志：打印当前激活的 AI 引擎与模型链
+            providers = config.get_configured_providers()
+            p_desc = " -> ".join([f"{p['name']}({p['model']})" for p in providers]) if providers else "无（使用纯列表兜底）"
+            log.info("当前有效 AI 分析引擎链: %s", p_desc)
+            status_record["configured_providers"] = [p["name"] for p in providers]
+
+            # 1. 抓取七大权威外媒（并发并行抓取）
+            log.info("正在并发抓取七大外媒（彭博社、路透社、华尔街日报、金融时报、联合早报、日经中文网、经济学人）...")
+            articles_by_source, errors = collect_all_sources(
+                lookback_hours=config.lookback_hours,
+                max_per_source=config.max_items_per_source
+            )
+            
+            total_articles = sum(len(v) for v in articles_by_source.values())
+            status_record["sources_scraped"] = {src: len(items) for src, items in articles_by_source.items()}
+            status_record["total_articles"] = total_articles
+            status_record["scraping_errors"] = list(errors)
+            log.info("抓取完成！共获取 %d 篇有效报道：", total_articles)
+            for src, items in articles_by_source.items():
+                log.info("  * %s: %d 篇", src, len(items))
+            if errors:
+                log.warning("抓取遇到以下告警: %s", "；".join(errors))
+
+            # 2. 深度分析与影响剖析
+            log.info("正在生成财经与中国宏观深度分析报告...")
+            report_markdown = analyze_news(articles_by_source, errors)
+            is_valid, integrity_issues = validate_report_integrity(report_markdown)
+            status_record["report_validation"] = {
+                "is_valid": is_valid,
+                "issues": integrity_issues,
+                "word_count": len(report_markdown),
+            }
+
+            # 3. 本地存储预览备份与高清长图生成
+            now = datetime.now(ZoneInfo(config.digest_timezone))
+            date_tag = now.strftime("%Y%m%d")
+            md_file = OUTPUT_DIR / f"digest_{date_tag}.md"
+            html_file = OUTPUT_DIR / f"digest_{date_tag}.html"
+            img_file = OUTPUT_DIR / f"digest_{date_tag}.png"
+            
+            html_content = render_html_document(report_markdown, errors)
+            md_file.write_text(report_markdown, encoding="utf-8")
+            html_file.write_text(html_content, encoding="utf-8")
+
+            # 渲染高清长图 (2x Retina 高清分辨率)
+            long_image_path = generate_digest_image(html_file, img_file)
+            if long_image_path and Path(long_image_path).exists():
+                status_record["image_generated"] = True
+                status_record["image_size_kb"] = round(Path(long_image_path).stat().st_size / 1024, 1)
+
+            log.info("已生成本地文件：\n  - Markdown: %s\n  - HTML: %s\n  - Long Image: %s",
+                     md_file, html_file, long_image_path or "(未生成)")
+
+            # 自动维护：清理过期旧输出
+            clean_old_outputs(config.output_retention_days)
+
+            # 4. 邮件发送
+            if dry_run:
+                log.info("[Dry Run 模式] 本次执行仅生成预览与长图，不发送邮件。")
+                status_record["overall_status"] = "SUCCESS_DRY_RUN"
+                return
+
+            log.info("正在向目标邮箱 [%s] 发送简报邮件（含高清长图附件）...", config.mail_to)
             send_digest_email(report_markdown, errors, image_path=long_image_path)
+            status_record["email_sent"] = True
+            status_record["overall_status"] = "SUCCESS"
             log.info("========== 简报任务成功完成！总耗时: %.1f 秒 ==========", time.perf_counter() - started_at)
+
         except Exception as exc:
-            log.error("邮件发送失败: %s: %s", type(exc).__name__, exc)
+            status_record["overall_status"] = "FAILED"
+            status_record["failure_reason"] = f"{type(exc).__name__}: {exc}"
+            log.error("简报任务执行失败: %s: %s", type(exc).__name__, exc)
             raise exc
+        finally:
+            status_record["completed_at"] = datetime.now(ZoneInfo(config.digest_timezone)).isoformat()
+            status_record["duration_seconds"] = round(time.perf_counter() - started_at, 2)
+            save_run_status(status_record)
 
 
 def run_scheduler() -> None:
