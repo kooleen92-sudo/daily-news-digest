@@ -2,12 +2,15 @@ name: Daily Finance & China News Digest
 
 on:
   schedule:
-    # 国际标准时间 UTC 23:35 对应北京时间 (UTC+8) 早上 07:35
-    # 完美处于 DeepSeek 谷时 5 折优惠时段内（18:00-09:00）
-    # 大幅避开 UTC 00:00 (北京时间 08:00) 全球定时任务高峰及 23:50 拥堵，确保 8 点前稳定送达
+    # 主触发：北京时间 07:35 (UTC 23:35)，处于 DeepSeek 谷时优惠时段，避开整点高峰
     - cron: '35 23 * * *'
+    # 容灾备用触发：北京时间 08:05 (UTC 00:05)，若主触发已成功则自动跳过，若主触发偶发丢失则自动兜底补发
+    - cron: '5 0 * * *'
   workflow_dispatch: # 支持在 GitHub 页面上手动点击按钮立即测试触发
 
+permissions:
+  actions: read
+  contents: read
 
 jobs:
   build-and-send:
@@ -29,12 +32,35 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
+      - name: Check If Already Sent Today (Idempotency Guard)
+        id: check_sent
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST_TIME=$(gh run list --workflow=daily_digest.yml --status=success --limit=1 --json createdAt -q '.[0].createdAt' || echo "")
+          if [ -n "$LATEST_TIME" ]; then
+            NOW_EPOCH=$(date +%s)
+            RUN_EPOCH=$(date -d "$LATEST_TIME" +%s 2>/dev/null || echo 0)
+            DIFF_MIN=$(( (NOW_EPOCH - RUN_EPOCH) / 60 ))
+            if [ $DIFF_MIN -ge 0 ] && [ $DIFF_MIN -lt 90 ]; then
+              echo "今日早报已于 $DIFF_MIN 分钟前成功发送，跳过执行以防重复推送。"
+              echo "already_sent=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+          echo "今日尚未成功发送，正常启动抓取与研报推送流程。"
+          echo "already_sent=false" >> $GITHUB_OUTPUT
+
       - name: Run Daily News & Impact Digest
+        if: steps.check_sent.outputs.already_sent != 'true'
         env:
           DIGEST_TIME: '08:00'
           DIGEST_TIMEZONE: 'Asia/Shanghai'
           LOOKBACK_HOURS: 24
           MAX_ITEMS_PER_SOURCE: 5
+          OUTPUT_RETENTION_DAYS: 7
+          COMPRESS_IMAGE: 'true'
           # 敏感信息从 GitHub 仓库 Secrets 读取
           MAIL_TO: ${{ secrets.MAIL_TO }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
@@ -45,15 +71,13 @@ jobs:
           SMTP_USE_SSL: ${{ secrets.SMTP_USE_SSL }}
           SMTP_USE_TLS: ${{ secrets.SMTP_USE_TLS }}
 
-          # 双引擎智能调度（Gemini 优先，DeepSeek 自动容灾接管）
+          # 多引擎智能调度配置
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
           GEMINI_BASE_URL: ${{ secrets.GEMINI_BASE_URL }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DEEPSEEK_MODEL: ${{ secrets.DEEPSEEK_MODEL }}
           DEEPSEEK_BASE_URL: ${{ secrets.DEEPSEEK_BASE_URL }}
-
-          # 兼容传统单模型配置
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
           LLM_MODEL: ${{ secrets.LLM_MODEL }}

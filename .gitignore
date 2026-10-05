@@ -14,7 +14,9 @@ venv/
 # Logs and outputs
 logs/
 output/
-test_*.py
+# Tests and caches
+/test_*.py
+.pytest_cache/
 
 # IDE
 .idea/

@@ -10,6 +10,3 @@ services:
     volumes:
       - ./output:/app/output
       - ./logs:/app/logs
-    environment:
-      - DIGEST_TIME=08:00
-      - DIGEST_TIMEZONE=Asia/Shanghai

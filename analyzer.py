@@ -72,8 +72,32 @@ USER_PROMPT_TEMPLATE = """请基于以下从彭博社、路透社、华尔街日
 
 
 
-def format_articles_for_prompt(articles_by_source: dict[str, list[NewsArticle]]) -> str:
-    """Format structured articles into a prompt context."""
+def validate_and_sanitize_links(markdown_content: str, articles_by_source: dict[str, list[NewsArticle]]) -> str:
+    """Ensure links in generated report match actual scraped articles, suppressing hallucinated links."""
+    valid_urls = set()
+    title_to_url = {}
+    for items in articles_by_source.values():
+        for a in items:
+            valid_urls.add(a.url.strip())
+            title_to_url[a.title.strip()] = a.url.strip()
+
+    def replace_link(match: re.Match) -> str:
+        anchor_text = match.group(1).strip()
+        url = match.group(2).strip()
+        if url in valid_urls or url.startswith("#"):
+            return match.group(0)
+        # Try matching title
+        if anchor_text in title_to_url:
+            return f"[{anchor_text}]({title_to_url[anchor_text]})"
+        # If url domain is totally fabricated or invalid, fallback to anchor text
+        return f"**{anchor_text}**"
+
+    import re
+    return re.sub(r"\[([^\]]+)\]\((https?://[^\s\)]+)\)", replace_link, markdown_content)
+
+
+def format_articles_for_prompt(articles_by_source: dict[str, list[NewsArticle]], max_summary_chars: int = 250) -> str:
+    """Format structured articles into a prompt context with strict token budget."""
     blocks = []
     item_index = 1
     
@@ -83,12 +107,15 @@ def format_articles_for_prompt(articles_by_source: dict[str, list[NewsArticle]])
         blocks.append(f"### 【{source_name}】（共 {len(items)} 条）")
         for a in items:
             pub_str = a.published_at.strftime("%Y-%m-%d %H:%M UTC")
+            summary_raw = a.summary or "（无摘要，参见标题）"
+            if len(summary_raw) > max_summary_chars:
+                summary_raw = summary_raw[:max_summary_chars] + "…"
             blocks.append(
                 f"[{item_index}] 来源：{a.source}\n"
                 f"标题：{a.title}\n"
                 f"发布时间：{pub_str}\n"
                 f"链接：{a.url}\n"
-                f"摘要/导语：{a.summary or '（无摘要，参见标题）'}\n"
+                f"摘要/导语：{summary_raw}\n"
             )
             item_index += 1
             
@@ -241,58 +268,27 @@ def analyze_news(articles_by_source: dict[str, list[NewsArticle]], errors: list[
     articles_text = format_articles_for_prompt(articles_by_source)
     prompt = USER_PROMPT_TEMPLATE.format(articles_text=articles_text)
 
-    # -------------------------------------------------------------
-    # Tier 1: 优先尝试 Google Gemini
-    # -------------------------------------------------------------
-    if config.gemini_api_key:
-        log.info("【Tier 1】优先使用 Google Gemini 引擎进行深度分析...")
-        # Candidates list: configured model first, followed by standard Gemini flash models
-        gemini_candidates = []
-        for m in [config.gemini_model, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
-            if m and m not in gemini_candidates:
-                gemini_candidates.append(m)
-
-        content, gemini_err = _call_llm_provider(
-            provider_name="Google Gemini",
-            api_key=config.gemini_api_key,
-            base_url=config.gemini_base_url,
-            candidate_models=gemini_candidates,
+    providers = config.get_configured_providers()
+    for idx, p in enumerate(providers, 1):
+        log.info("【Tier %d】尝试使用 %s 引擎（模型: %s）进行深度分析...", idx, p["name"], p["model"])
+        content, err = _call_llm_provider(
+            provider_name=p["name"],
+            api_key=p["api_key"],
+            base_url=p["base_url"],
+            candidate_models=p["candidates"],
             prompt=prompt,
         )
         if content:
-            footer_note = f"\n\n---\n*🤖 本期研报由 Google Gemini 旗舰引擎分析生成*"
-            return content + footer_note
+            footer_note = f"\n\n---\n*🤖 本期研报由 {p['name']} 智能引擎分析生成*"
+            cleaned_content = validate_and_sanitize_links(content, articles_by_source)
+            return cleaned_content + footer_note
         else:
-            warn_msg = f"Gemini 尝试失败: {type(gemini_err).__name__}: {gemini_err}"
-            log.warning("%s。准备无缝切换至 DeepSeek 容灾备份...", warn_msg)
+            warn_msg = f"{p['name']} 尝试失败: {type(err).__name__}: {err}"
+            log.warning("%s。准备尝试下一个备用引擎...", warn_msg)
             errors.append(warn_msg)
 
     # -------------------------------------------------------------
-    # Tier 2: 容灾备份：调用 DeepSeek
-    # -------------------------------------------------------------
-    if config.deepseek_api_key:
-        log.info("【Tier 2】触发容灾切换：使用 DeepSeek 引擎进行深度分析...")
-        deepseek_candidates = []
-        for m in [config.deepseek_model, "deepseek-chat"]:
-            if m and m not in deepseek_candidates:
-                deepseek_candidates.append(m)
-        content, ds_err = _call_llm_provider(
-            provider_name="DeepSeek",
-            api_key=config.deepseek_api_key,
-            base_url=config.deepseek_base_url,
-            candidate_models=deepseek_candidates,
-            prompt=prompt,
-        )
-        if content:
-            footer_note = f"\n\n---\n*🤖 本期研报由 DeepSeek 智能引擎分析生成（Gemini 节点繁忙自动容灾切换）*"
-            return content + footer_note
-        else:
-            warn_msg = f"DeepSeek 尝试失败: {type(ds_err).__name__}: {ds_err}"
-            log.error("%s", warn_msg)
-            errors.append(warn_msg)
-
-    # -------------------------------------------------------------
-    # Tier 3: 最终兜底排版（无大模型或全部超时报错）
+    # Tier 4: 最终兜底排版（无大模型或全部超时报错）
     # -------------------------------------------------------------
     log.warning("所有大模型均未配置或调用失败，使用结构化新闻列表兜底排版。")
     return generate_fallback_report(articles_by_source, errors)

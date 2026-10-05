@@ -22,14 +22,17 @@ import html
 import logging
 import re
 import urllib.parse
-import urllib.request
-import ssl
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, List, Set, Tuple
 from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup
 import feedparser
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from config import config
 
 log = logging.getLogger("daily-news")
 
@@ -38,10 +41,17 @@ DEFAULT_USER_AGENT = (
     "Chrome/124.0 Safari/537.36 DailyNewsDigest/1.0"
 )
 
-# SSL context that allows standard requests
-SSL_CTX = ssl.create_default_context()
-SSL_CTX.check_hostname = False
-SSL_CTX.verify_mode = ssl.CERT_NONE
+# Global requests Session with pooling and exponential backoff
+_SESSION = requests.Session()
+_RETRY_STRATEGY = Retry(
+    total=2,
+    backoff_factor=0.5,
+    status_forcelist=[500, 502, 503, 504],
+    raise_on_status=False
+)
+_ADAPTER = HTTPAdapter(max_retries=_RETRY_STRATEGY, pool_connections=10, pool_maxsize=20)
+_SESSION.mount("https://", _ADAPTER)
+_SESSION.mount("http://", _ADAPTER)
 
 
 @dataclass
@@ -66,8 +76,25 @@ def clean_text(raw_text: str, max_length: int = 1000) -> str:
     return text[:max_length]
 
 
-def http_get(url: str, timeout: float = 12.0, extra_headers: dict[str, str] | None = None) -> bytes:
-    """Send HTTP GET request with standard browser headers."""
+def normalize_url(raw_url: str) -> str:
+    """Strip tracking query parameters (UTM, spm, ref, etc.) for accurate deduplication."""
+    if not raw_url:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(raw_url.strip())
+        filtered_queries = [
+            (k, v) for k, v in urllib.parse.parse_qsl(parsed.query)
+            if not (k.startswith("utm_") or k in {"spm", "from", "ref", "source", "feature", "ocid", "ved"})
+        ]
+        new_query = urllib.parse.urlencode(filtered_queries)
+        return urllib.parse.urlunparse(parsed._replace(query=new_query, fragment="")).strip()
+    except Exception:
+        return raw_url.strip()
+
+
+def http_get(url: str, timeout: float | None = None, extra_headers: dict[str, str] | None = None) -> bytes:
+    """Send HTTP GET request with connection pool, automatic retries and standard headers."""
+    timeout = config.fetch_timeout if timeout is None else timeout
     headers = {
         "User-Agent": DEFAULT_USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/rss+xml,*/*;q=0.8",
@@ -76,33 +103,41 @@ def http_get(url: str, timeout: float = 12.0, extra_headers: dict[str, str] | No
     if extra_headers:
         headers.update(extra_headers)
 
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as response:
-        return response.read()
+    resp = _SESSION.get(url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    return resp.content
 
 
-def parse_feed_datetime(entry: Any) -> datetime:
-    """Extract entry publish time in UTC."""
+def parse_feed_datetime(entry: Any) -> datetime | None:
+    """Extract entry publish time in UTC, or None when unavailable."""
     for field_name in ("published_parsed", "updated_parsed", "created_parsed"):
         parsed = entry.get(field_name)
         if parsed:
             return datetime.fromtimestamp(calendar.timegm(parsed), tz=timezone.utc)
-    return datetime.now(timezone.utc)
+    return None
+
+
+def _contains_keyword(text: str, keyword: str) -> bool:
+    """Match Chinese phrases or complete English words, avoiding substring noise."""
+    if any("\u4e00" <= ch <= "\u9fff" for ch in keyword):
+        return keyword in text
+    return re.search(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", text) is not None
 
 
 def is_relevant_china_or_finance(title: str, summary: str) -> bool:
     """
     Check if the article pertains to Finance / Economy OR China mainland.
-    For targeted feeds (like Bloomberg Markets or WSJ Markets), most are finance,
-    but we filter out pure lifestyle/sports/entertainment if any.
+    Uses precise financial phrases to prevent false positive triggers (e.g. crime rate / first rate).
     """
     text = (title + " " + summary).lower()
     
-    # Financial keywords
+    # Financial keywords (precise phrases to avoid false matches on words like 'rate')
     finance_keywords = [
-        "market", "stock", "bond", "yield", "rate", "fed", "central bank", "inflation",
+        "market", "stock", "bond", "yield", "fed", "central bank", "inflation",
         "economy", "economic", "gdp", "trade", "dollar", "yuan", "cnh", "oil", "gold",
-        "bank", "invest", "ai", "chip", "semiconductor", "earnings", "tariff", "debt",
+        "bank", "invest", "chip", "semiconductor", "earnings", "tariff", "debt",
+        "interest rate", "mortgage rate", "policy rate", "rate cut", "rate hike", "benchmark rate", "exchange rate", "lending rate",
+        "artificial intelligence", "generative ai", "ai chip",
         "财经", "经济", "股市", "股票", "债券", "收益率", "央行", "通胀", "降息", "加息",
         "外汇", "汇率", "人民币", "美元", "黄金", "原油", "银行", "投资", "芯片", "半导体",
         "财报", "关税", "贸易", "债务", "资产", "消费", "出口", "房地产", "楼市"
@@ -118,11 +153,11 @@ def is_relevant_china_or_finance(title: str, summary: str) -> bool:
     ]
     
     for kw in china_keywords:
-        if kw in text:
+        if _contains_keyword(text, kw):
             return True
             
     for kw in finance_keywords:
-        if kw in text:
+        if _contains_keyword(text, kw):
             return True
 
     return False
@@ -140,7 +175,7 @@ def fetch_rss_feed(
     articles: list[NewsArticle] = []
     
     try:
-        content = http_get(url)
+        content = http_get(url, timeout=config.fetch_timeout)
         parsed = feedparser.parse(content)
         for entry in parsed.entries:
             title = clean_text(entry.get("title", ""), 250)
@@ -158,6 +193,9 @@ def fetch_rss_feed(
                 continue
                 
             pub_date = parse_feed_datetime(entry)
+            if pub_date is None:
+                log.debug("Skipping undated RSS item from %s: %s", source_name, title)
+                continue
             # If pub_date is older than cutoff, skip (allow slight clock skew)
             if pub_date < (cutoff - timedelta(hours=2)):
                 continue
@@ -198,7 +236,7 @@ def fetch_zaobao_direct(lookback_hours: int = 24, max_items: int = 10) -> list[N
     
     for section_url, section_name in sections:
         try:
-            html_bytes = http_get(section_url)
+            html_bytes = http_get(section_url, timeout=config.fetch_timeout)
             soup = BeautifulSoup(html_bytes.decode("utf-8", errors="ignore"), "html.parser")
             
             # Find story links like /news/china/story20260929-9756572
@@ -221,9 +259,13 @@ def fetch_zaobao_direct(lookback_hours: int = 24, max_items: int = 10) -> list[N
                 date_match = re.search(r"story(\d{4})(\d{2})(\d{2})-", href)
                 if date_match:
                     year, month, day = map(int, date_match.groups())
-                    pub_date = datetime(year, month, day, 4, 0, tzinfo=timezone.utc)  # estimated
+                    pub_date = datetime(year, month, day, tzinfo=ZoneInfo("Asia/Singapore")).astimezone(timezone.utc)
                 else:
-                    pub_date = datetime.now(timezone.utc)
+                    # Do not turn an undated page card into a fresh article.
+                    continue
+
+                if pub_date < cutoff:
+                    continue
                     
                 # We can fetch snippet from parent card text if available
                 card_text = ""
@@ -253,11 +295,14 @@ def fetch_zaobao_direct(lookback_hours: int = 24, max_items: int = 10) -> list[N
     return articles
 
 
-def deduplicate_articles(articles: list[NewsArticle], similarity_threshold: float = 0.85) -> list[NewsArticle]:
+def deduplicate_articles(articles: list[NewsArticle], similarity_threshold: float | None = None) -> list[NewsArticle]:
     """
     Deduplicate articles by exact URL, exact title, and near-duplicate title.
     Preserves unique content across sources.
     """
+    if similarity_threshold is None:
+        similarity_threshold = config.dedupe_similarity
+
     unique_articles: list[NewsArticle] = []
     seen_urls: set[str] = set()
     seen_titles: list[str] = []
@@ -318,242 +363,186 @@ def collect_all_sources(lookback_hours: int = 24, max_per_source: int = 6) -> tu
     }
     errors: list[str] = []
 
-    # 1. 彭博社 (Bloomberg)
-    bloomberg_items = []
-    # Primary: Bloomberg Markets RSS
+def _fetch_bloomberg(lookback_hours: int, max_per_source: int) -> list[NewsArticle]:
+    items = []
     try:
-        bbg_rss = fetch_rss_feed(
-            "彭博社",
-            "https://feeds.bloomberg.com/markets/news.rss",
-            lookback_hours=lookback_hours,
-            max_items=max_per_source
-        )
-        bloomberg_items.extend(bbg_rss)
+        items.extend(fetch_rss_feed("彭博社", "https://feeds.bloomberg.com/markets/news.rss", lookback_hours, max_per_source))
     except Exception as e:
         log.warning("Bloomberg official RSS error: %s", e)
+    if len(items) < max_per_source:
+        try:
+            items.extend(fetch_rss_feed(
+                "彭博社",
+                "https://news.google.com/rss/search?q=site:bloomberg.com+(China+OR+Yuan+OR+CSI300+OR+PBOC+OR+Economy)&hl=en-US&gl=US&ceid=US:en",
+                lookback_hours, max_per_source, force_relevant=True
+            ))
+        except Exception as e:
+            log.warning("Bloomberg China GNews RSS error: %s", e)
+    return items
 
-    # Secondary: Bloomberg China & Economy via Google News RSS
+
+def _fetch_reuters(lookback_hours: int, max_per_source: int) -> list[NewsArticle]:
+    items = []
     try:
-        bbg_china = fetch_rss_feed(
-            "彭博社",
-            "https://news.google.com/rss/search?q=site:bloomberg.com+(China+OR+Yuan+OR+CSI300+OR+PBOC+OR+Economy)&hl=en-US&gl=US&ceid=US:en",
-            lookback_hours=lookback_hours,
-            max_items=max_per_source,
-            force_relevant=True
-        )
-        bloomberg_items.extend(bbg_china)
-    except Exception as e:
-        log.warning("Bloomberg China GNews RSS error: %s", e)
-
-    if bloomberg_items:
-        results["彭博社"] = deduplicate_articles(bloomberg_items)[:max_per_source]
-    else:
-        errors.append("彭博社：未能成功拉取更新")
-
-    # 2. 路透社 (Reuters)
-    reuters_items = []
-    try:
-        # Reuters China & Economy
-        rt_china = fetch_rss_feed(
+        items.extend(fetch_rss_feed(
             "路透社",
             "https://news.google.com/rss/search?q=site:reuters.com+(China+OR+economy+OR+markets+OR+yuan)&hl=en-US&gl=US&ceid=US:en",
-            lookback_hours=lookback_hours,
-            max_items=max_per_source,
-            force_relevant=True
-        )
-        reuters_items.extend(rt_china)
+            lookback_hours, max_per_source, force_relevant=True
+        ))
     except Exception as e:
         log.warning("Reuters China RSS error: %s", e)
+    if len(items) < max_per_source:
+        try:
+            items.extend(fetch_rss_feed(
+                "路透社",
+                "https://news.google.com/rss/search?q=site:reuters.com+(business+OR+markets)&hl=en-US&gl=US&ceid=US:en",
+                lookback_hours, max_per_source, force_relevant=True
+            ))
+        except Exception as e:
+            log.warning("Reuters Business RSS error: %s", e)
+    return items
 
+
+def _fetch_wsj(lookback_hours: int, max_per_source: int) -> list[NewsArticle]:
+    items = []
     try:
-        # Reuters Business
-        rt_biz = fetch_rss_feed(
-            "路透社",
-            "https://news.google.com/rss/search?q=site:reuters.com+(business+OR+markets)&hl=en-US&gl=US&ceid=US:en",
-            lookback_hours=lookback_hours,
-            max_items=max_per_source,
-            force_relevant=True
-        )
-        reuters_items.extend(rt_biz)
-    except Exception as e:
-        log.warning("Reuters Business RSS error: %s", e)
-
-    if reuters_items:
-        results["路透社"] = deduplicate_articles(reuters_items)[:max_per_source]
-    else:
-        errors.append("路透社：未能成功拉取更新")
-
-    # 3. 华尔街日报 (Wall Street Journal / WSJ)
-    wsj_items = []
-    try:
-        wsj_mkt = fetch_rss_feed(
-            "华尔街日报",
-            "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
-            lookback_hours=lookback_hours,
-            max_items=max_per_source
-        )
-        wsj_items.extend(wsj_mkt)
+        items.extend(fetch_rss_feed("华尔街日报", "https://feeds.a.dj.com/rss/RSSMarketsMain.xml", lookback_hours, max_per_source))
     except Exception as e:
         log.warning("WSJ Markets RSS error: %s", e)
+    if len(items) < max_per_source:
+        try:
+            items.extend(fetch_rss_feed(
+                "华尔街日报",
+                "https://news.google.com/rss/search?q=site:wsj.com+(China+OR+Trade+OR+Yuan)&hl=en-US&gl=US&ceid=US:en",
+                lookback_hours, max_per_source, force_relevant=True
+            ))
+        except Exception as e:
+            log.warning("WSJ China GNews error: %s", e)
+    return items
 
+
+def _fetch_ft(lookback_hours: int, max_per_source: int) -> list[NewsArticle]:
+    items = []
     try:
-        wsj_china = fetch_rss_feed(
-            "华尔街日报",
-            "https://news.google.com/rss/search?q=site:wsj.com+(China+OR+Trade+OR+Yuan)&hl=en-US&gl=US&ceid=US:en",
-            lookback_hours=lookback_hours,
-            max_items=max_per_source,
-            force_relevant=True
-        )
-        wsj_items.extend(wsj_china)
-    except Exception as e:
-        log.warning("WSJ China GNews error: %s", e)
-
-    if wsj_items:
-        results["华尔街日报"] = deduplicate_articles(wsj_items)[:max_per_source]
-    else:
-        errors.append("华尔街日报：未能成功拉取更新")
-
-    # 4. 金融时报 (Financial Times / FT)
-    ft_items = []
-    try:
-        # FT Chinese RSS (Official Chinese feed)
-        ftc = fetch_rss_feed(
-            "金融时报",
-            "https://www.ftchinese.com/rss/feed",
-            lookback_hours=lookback_hours,
-            max_items=max_per_source
-        )
-        ft_items.extend(ftc)
+        items.extend(fetch_rss_feed("金融时报", "https://www.ftchinese.com/rss/feed", lookback_hours, max_per_source))
     except Exception as e:
         log.warning("FT Chinese RSS error: %s", e)
+    if len(items) < max_per_source:
+        try:
+            items.extend(fetch_rss_feed("金融时报", "https://www.ft.com/rss/markets", lookback_hours, max_per_source))
+        except Exception as e:
+            log.warning("FT Markets RSS error: %s", e)
+    return items
 
+
+def _fetch_zaobao(lookback_hours: int, max_per_source: int) -> list[NewsArticle]:
+    items = []
     try:
-        # FT Markets Global RSS
-        ft_mkt = fetch_rss_feed(
-            "金融时报",
-            "https://www.ft.com/rss/markets",
-            lookback_hours=lookback_hours,
-            max_items=max_per_source
-        )
-        ft_items.extend(ft_mkt)
-    except Exception as e:
-        log.warning("FT Markets RSS error: %s", e)
-
-    if ft_items:
-        results["金融时报"] = deduplicate_articles(ft_items)[:max_per_source]
-    else:
-        errors.append("金融时报：未能成功拉取更新")
-
-    # 5. 联合早报 (Lianhe Zaobao)
-    zaobao_items = []
-    # Primary: Direct web scrape from zaobao.com.sg
-    try:
-        zb_direct = fetch_zaobao_direct(lookback_hours=lookback_hours, max_items=max_per_source)
-        zaobao_items.extend(zb_direct)
+        items.extend(fetch_zaobao_direct(lookback_hours, max_per_source))
     except Exception as e:
         log.warning("Zaobao direct scrape error: %s", e)
-
-    # Secondary / Backup: Google News RSS for Zaobao
-    if len(zaobao_items) < max_per_source:
+    if len(items) < max_per_source:
         try:
-            zb_gnews = fetch_rss_feed(
+            items.extend(fetch_rss_feed(
                 "联合早报",
                 "https://news.google.com/rss/search?q=site:zaobao.com.sg+(%E4%B8%AD%E5%9B%BD+OR+%E8%B4%A2%E7%BB%8F)&hl=zh-CN&gl=SG&ceid=SG:zh-Hans",
-                lookback_hours=lookback_hours,
-                max_items=max_per_source,
-                force_relevant=True
-            )
-            zaobao_items.extend(zb_gnews)
+                lookback_hours, max_per_source, force_relevant=True
+            ))
         except Exception as e:
             log.warning("Zaobao GNews RSS error: %s", e)
+    return items
 
-    if zaobao_items:
-        results["联合早报"] = deduplicate_articles(zaobao_items)[:max_per_source]
-    else:
-        errors.append("联合早报：未能成功拉取更新")
 
-    # 6. 日经中文网 (Nikkei Chinese / Nikkei Asia)
-    nikkei_items = []
-    # 针对节假日/周末（如黄金周多日休假）及深度专栏，放宽回溯窗口至 96 小时（4天），确保稳定拉取
-    nikkei_lookback = max(lookback_hours, 96)
+def _fetch_nikkei(lookback_hours: int, max_per_source: int) -> list[NewsArticle]:
+    items = []
+    lookback = max(lookback_hours, 96)
     try:
-        nikkei_target = fetch_rss_feed(
+        items.extend(fetch_rss_feed(
             "日经中文网",
             "https://news.google.com/rss/search?q=site:cn.nikkei.com+(%E4%B8%AD%E5%9B%BD+OR+%E7%BB%8F%E6%B5%8E+OR+%E5%8D%8A%E5%AF%BC%E4%BD%93+OR+%E6%97%A5%E5%85%83+OR+%E5%B8%82%E5%9C%BA+OR+%E4%BA%A7%E4%B8%9A)&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
-            lookback_hours=nikkei_lookback,
-            max_items=max_per_source,
-            force_relevant=False,
-        )
-        nikkei_items.extend(nikkei_target)
+            lookback, max_per_source, force_relevant=False
+        ))
     except Exception as e:
         log.warning("Nikkei targeted GNews RSS error: %s", e)
-
-    if len(nikkei_items) < max_per_source:
+    if len(items) < max_per_source:
         try:
-            nikkei_gen = fetch_rss_feed(
+            items.extend(fetch_rss_feed(
                 "日经中文网",
                 "https://news.google.com/rss/search?q=site:cn.nikkei.com&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
-                lookback_hours=nikkei_lookback,
-                max_items=max_per_source,
-                force_relevant=True,
-            )
-            nikkei_items.extend(nikkei_gen)
+                lookback, max_per_source, force_relevant=True
+            ))
         except Exception as e:
             log.warning("Nikkei general GNews RSS error: %s", e)
+    for a in items:
+        a.category = "财经/中国·深度专栏"
+    return items
 
-    if nikkei_items:
-        results["日经中文网"] = deduplicate_articles(nikkei_items)[:max_per_source]
-    else:
-        errors.append("日经中文网：未能成功拉取更新")
 
-    # 7. 经济学人 (The Economist)
-    economist_items = []
-    # 经济学人以长周期、深度宏观分析为主，放宽回溯时间窗口以锁定高含金量专栏
-    econ_lookback = max(lookback_hours, 96)
-
-    # 7.1 官方财经与宏观专栏 RSS
+def _fetch_economist(lookback_hours: int, max_per_source: int) -> list[NewsArticle]:
+    items = []
+    lookback = max(lookback_hours, 96)
     try:
-        econ_fin = fetch_rss_feed(
-            "经济学人",
-            "https://www.economist.com/finance-and-economics/rss.xml",
-            lookback_hours=econ_lookback,
-            max_items=max_per_source,
-            force_relevant=False,
-        )
-        economist_items.extend(econ_fin)
+        items.extend(fetch_rss_feed("经济学人", "https://www.economist.com/finance-and-economics/rss.xml", lookback, max_per_source))
     except Exception as e:
         log.warning("The Economist Finance RSS error: %s", e)
-
-    # 7.2 官方中国专栏 RSS
-    try:
-        econ_china = fetch_rss_feed(
-            "经济学人",
-            "https://www.economist.com/china/rss.xml",
-            lookback_hours=econ_lookback,
-            max_items=max_per_source,
-            force_relevant=False,
-        )
-        economist_items.extend(econ_china)
-    except Exception as e:
-        log.warning("The Economist China RSS error: %s", e)
-
-    # 7.3 Google News 宏观与中国补充流
-    if len(economist_items) < max_per_source:
+    if len(items) < max_per_source:
         try:
-            econ_gnews = fetch_rss_feed(
+            items.extend(fetch_rss_feed("经济学人", "https://www.economist.com/china/rss.xml", lookback, max_per_source))
+        except Exception as e:
+            log.warning("The Economist China RSS error: %s", e)
+    if len(items) < max_per_source:
+        try:
+            items.extend(fetch_rss_feed(
                 "经济学人",
                 "https://news.google.com/rss/search?q=site:economist.com+(China+OR+economy+OR+markets+OR+finance+OR+Fed)&hl=en-US&gl=US&ceid=US:en",
-                lookback_hours=econ_lookback,
-                max_items=max_per_source,
-                force_relevant=True,
-            )
-            economist_items.extend(econ_gnews)
+                lookback, max_per_source, force_relevant=True
+            ))
         except Exception as e:
             log.warning("The Economist GNews RSS error: %s", e)
+    for a in items:
+        a.category = "财经/中国·深度专栏"
+    return items
 
-    if economist_items:
-        results["经济学人"] = deduplicate_articles(economist_items)[:max_per_source]
-    else:
-        errors.append("经济学人：未能成功拉取更新")
+
+def collect_all_sources(lookback_hours: int = 24, max_per_source: int = 6) -> tuple[dict[str, list[NewsArticle]], list[str]]:
+    """
+    Collect news from all 7 media outlets in parallel using ThreadPoolExecutor.
+    """
+    results: dict[str, list[NewsArticle]] = {
+        "彭博社": [],
+        "路透社": [],
+        "华尔街日报": [],
+        "金融时报": [],
+        "联合早报": [],
+        "日经中文网": [],
+        "经济学人": [],
+    }
+    errors: list[str] = []
+
+    collectors = {
+        "彭博社": lambda: _fetch_bloomberg(lookback_hours, max_per_source),
+        "路透社": lambda: _fetch_reuters(lookback_hours, max_per_source),
+        "华尔街日报": lambda: _fetch_wsj(lookback_hours, max_per_source),
+        "金融时报": lambda: _fetch_ft(lookback_hours, max_per_source),
+        "联合早报": lambda: _fetch_zaobao(lookback_hours, max_per_source),
+        "日经中文网": lambda: _fetch_nikkei(lookback_hours, max_per_source),
+        "经济学人": lambda: _fetch_economist(lookback_hours, max_per_source),
+    }
+
+    # Parallel collection
+    with ThreadPoolExecutor(max_workers=len(collectors)) as executor:
+        future_to_src = {executor.submit(func): src for src, func in collectors.items()}
+        for future in as_completed(future_to_src):
+            src = future_to_src[future]
+            try:
+                raw_items = future.result()
+                if raw_items:
+                    results[src] = deduplicate_articles(raw_items)[:max_per_source]
+                else:
+                    errors.append(f"{src}：未能成功拉取更新")
+            except Exception as e:
+                log.warning("抓取源 [%s] 异常: %s", src, e)
+                errors.append(f"{src}：抓取异常 ({type(e).__name__})")
 
     return results, errors
+

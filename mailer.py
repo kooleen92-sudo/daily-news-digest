@@ -7,6 +7,7 @@ Renders responsive HTML emails and sends via SMTP (SSL/TLS).
 from __future__ import annotations
 
 import logging
+import html as html_lib
 import smtplib
 from email.message import EmailMessage
 from email.utils import format_datetime
@@ -14,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 import markdown
+import bleach
 
 from config import config
 
@@ -214,10 +216,22 @@ def render_html_document(body_markdown: str, errors: list[str]) -> str:
         body_markdown,
         extensions=["tables", "fenced_code", "nl2br", "sane_lists"]
     )
+    body_html = bleach.clean(
+        body_html,
+        tags={
+            "a", "p", "br", "hr", "strong", "em", "del", "blockquote",
+            "ul", "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+            "pre", "code", "table", "thead", "tbody", "tr", "th", "td",
+        },
+        attributes={"a": ["href", "title", "target", "rel"]},
+        protocols={"http", "https", "mailto"},
+        strip=True,
+    )
 
     warnings_html = ""
     if errors:
-        warnings_html = f'<div class="warning-box">⚠️ <strong>抓取警告：</strong>{"；".join(errors)}</div>'
+        safe_errors = html_lib.escape("；".join(errors))
+        warnings_html = f'<div class="warning-box">⚠️ <strong>抓取警告：</strong>{safe_errors}</div>'
 
     html = HTML_TEMPLATE.format(
         title=f"每日财经与中国宏观深度简报 - {date_str}",
@@ -279,18 +293,29 @@ def send_digest_email(body_markdown: str, errors: list[str], image_path: Path | 
     def _do_send(msg: EmailMessage) -> None:
         log.info("Connecting to SMTP server %s:%d (SSL=%s, TLS=%s)...",
                  config.smtp_host, config.smtp_port, config.smtp_use_ssl, config.smtp_use_tls)
-        if config.smtp_use_ssl:
-            with smtplib.SMTP_SSL(config.smtp_host, config.smtp_port, timeout=30) as smtp:
-                if config.smtp_user and config.smtp_password:
-                    smtp.login(config.smtp_user, config.smtp_password)
-                smtp.send_message(msg)
-        else:
-            with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=30) as smtp:
-                if config.smtp_use_tls:
-                    smtp.starttls()
-                if config.smtp_user and config.smtp_password:
-                    smtp.login(config.smtp_user, config.smtp_password)
-                smtp.send_message(msg)
+        max_attempts = 2
+        for attempt in range(max_attempts):
+            try:
+                if config.smtp_use_ssl:
+                    with smtplib.SMTP_SSL(config.smtp_host, config.smtp_port, timeout=30) as smtp:
+                        if config.smtp_user and config.smtp_password:
+                            smtp.login(config.smtp_user, config.smtp_password)
+                        smtp.send_message(msg)
+                else:
+                    with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=30) as smtp:
+                        if config.smtp_use_tls:
+                            smtp.starttls()
+                        if config.smtp_user and config.smtp_password:
+                            smtp.login(config.smtp_user, config.smtp_password)
+                        smtp.send_message(msg)
+                return
+            except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, TimeoutError, OSError) as e:
+                if attempt < max_attempts - 1:
+                    log.warning("SMTP 传输遇到网络波动 (%s)，3 秒后自动重试...", e)
+                    import time
+                    time.sleep(3)
+                else:
+                    raise e
 
     try:
         _do_send(message)

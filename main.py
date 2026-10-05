@@ -54,61 +54,132 @@ logging.basicConfig(
 log = logging.getLogger("daily-news")
 
 
+def clean_old_outputs(retention_days: int = 7) -> None:
+    """Retain only recent N days of generated reports in output directory to prevent disk exhaustion."""
+    if not OUTPUT_DIR.exists():
+        return
+    cutoff_time = time.time() - (retention_days * 86400)
+    cleaned_count = 0
+    reclaimed_bytes = 0
+    for f in OUTPUT_DIR.glob("*"):
+        if f.is_file() and f.suffix.lower() in {".html", ".md", ".png", ".jpg", ".jpeg"}:
+            try:
+                mtime = f.stat().st_mtime
+                if mtime < cutoff_time:
+                    reclaimed_bytes += f.stat().st_size
+                    f.unlink()
+                    cleaned_count += 1
+            except Exception as e:
+                log.debug("清理文件失败 %s: %s", f, e)
+    if cleaned_count > 0:
+        log.info("已自动清理 %d 个超过 %d 天的旧报告文件，释放空间: %.1f MB",
+                 cleaned_count, retention_days, reclaimed_bytes / (1024 * 1024))
+
+
+class SingleInstanceLock:
+    """Simple file-based lock to prevent overlapping scheduled/manual runs."""
+    def __init__(self, lock_file: Path):
+        self.lock_file = lock_file
+        self.acquired = False
+
+    def __enter__(self) -> bool:
+        if self.lock_file.exists():
+            try:
+                age = time.time() - self.lock_file.stat().st_mtime
+                if age < 1800:
+                    log.warning("检测到已有任务实例正在运行 (锁文件: %s，已存在 %.0f 秒)，终止本次执行以防并发冲突。",
+                                self.lock_file.name, age)
+                    return False
+                else:
+                    log.warning("发现超过 30 分钟的残留锁文件，自动重置接管。")
+                    self.lock_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+        try:
+            self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+            self.lock_file.write_text(str(time.time()), encoding="utf-8")
+            self.acquired = True
+            return True
+        except Exception as e:
+            log.warning("锁文件创建受阻: %s，继续执行", e)
+            return True
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.acquired:
+            try:
+                self.lock_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 def execute_digest(*, dry_run: bool = False) -> None:
     """Execute a complete news collection, analysis, and delivery cycle."""
-    log.info("========== 开始执行每日财经与中国宏观简报任务 ==========")
-    started_at = time.perf_counter()
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    lock = SingleInstanceLock(OUTPUT_DIR.parent / ".daily_digest.lock")
+    with lock as ok:
+        if not ok:
+            return
 
-    # 1. 抓取七大权威外媒
-    log.info("正在抓取七大外媒（彭博社、路透社、华尔街日报、金融时报、联合早报、日经中文网、经济学人）过去 %d 小时新闻...", config.lookback_hours)
-    articles_by_source, errors = collect_all_sources(
-        lookback_hours=config.lookback_hours,
-        max_per_source=config.max_items_per_source
-    )
-    
-    total_articles = sum(len(v) for v in articles_by_source.values())
-    log.info("抓取完成！共获取 %d 篇有效报道：", total_articles)
-    for src, items in articles_by_source.items():
-        log.info("  * %s: %d 篇", src, len(items))
-    if errors:
-        log.warning("抓取遇到以下告警: %s", "；".join(errors))
+        log.info("========== 开始执行每日财经与中国宏观简报任务 ==========")
+        started_at = time.perf_counter()
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 2. 深度分析与影响剖析
-    log.info("正在生成财经与中国宏观深度分析报告...")
-    report_markdown = analyze_news(articles_by_source, errors)
+        # 启动日志：打印当前激活的 AI 引擎与模型链
+        providers = config.get_configured_providers()
+        p_desc = " -> ".join([f"{p['name']}({p['model']})" for p in providers]) if providers else "无（使用纯列表兜底）"
+        log.info("当前有效 AI 分析引擎链: %s", p_desc)
 
-    # 3. 本地存储预览备份与高清长图生成
-    now = datetime.now(ZoneInfo(config.digest_timezone))
-    date_tag = now.strftime("%Y%m%d")
-    md_file = OUTPUT_DIR / f"digest_{date_tag}.md"
-    html_file = OUTPUT_DIR / f"digest_{date_tag}.html"
-    img_file = OUTPUT_DIR / f"digest_{date_tag}.png"
-    
-    html_content = render_html_document(report_markdown, errors)
-    md_file.write_text(report_markdown, encoding="utf-8")
-    html_file.write_text(html_content, encoding="utf-8")
+        # 1. 抓取七大权威外媒（并发并行抓取）
+        log.info("正在并发抓取七大外媒（彭博社、路透社、华尔街日报、金融时报、联合早报、日经中文网、经济学人）...")
+        articles_by_source, errors = collect_all_sources(
+            lookback_hours=config.lookback_hours,
+            max_per_source=config.max_items_per_source
+        )
+        
+        total_articles = sum(len(v) for v in articles_by_source.values())
+        log.info("抓取完成！共获取 %d 篇有效报道：", total_articles)
+        for src, items in articles_by_source.items():
+            log.info("  * %s: %d 篇", src, len(items))
+        if errors:
+            log.warning("抓取遇到以下告警: %s", "；".join(errors))
 
-    # 渲染高清长图 (2x Retina 高清分辨率)
-    long_image_path = generate_digest_image(html_file, img_file)
+        # 2. 深度分析与影响剖析
+        log.info("正在生成财经与中国宏观深度分析报告...")
+        report_markdown = analyze_news(articles_by_source, errors)
 
-    log.info("已生成本地文件：\n  - Markdown: %s\n  - HTML: %s\n  - Long Image: %s",
-             md_file, html_file, long_image_path or "(未生成)")
+        # 3. 本地存储预览备份与高清长图生成
+        now = datetime.now(ZoneInfo(config.digest_timezone))
+        date_tag = now.strftime("%Y%m%d")
+        md_file = OUTPUT_DIR / f"digest_{date_tag}.md"
+        html_file = OUTPUT_DIR / f"digest_{date_tag}.html"
+        img_file = OUTPUT_DIR / f"digest_{date_tag}.png"
+        
+        html_content = render_html_document(report_markdown, errors)
+        md_file.write_text(report_markdown, encoding="utf-8")
+        html_file.write_text(html_content, encoding="utf-8")
 
-    # 4. 邮件发送
-    if dry_run:
-        log.info("[Dry Run 模式] 本次执行仅生成预览与长图，不发送邮件。")
-        log.info("报告字数：%d，耗时：%.1f 秒", len(report_markdown), time.perf_counter() - started_at)
-        return
+        # 渲染高清长图 (2x Retina 高清分辨率)
+        long_image_path = generate_digest_image(html_file, img_file)
 
-    log.info("正在向目标邮箱 [%s] 发送简报邮件（含高清长图附件）...", config.mail_to)
-    try:
-        send_digest_email(report_markdown, errors, image_path=long_image_path)
-        log.info("========== 简报任务成功完成！总耗时: %.1f 秒 ==========", time.perf_counter() - started_at)
-    except Exception as exc:
-        log.error("邮件发送失败: %s: %s", type(exc).__name__, exc)
-        raise exc
+        log.info("已生成本地文件：\n  - Markdown: %s\n  - HTML: %s\n  - Long Image: %s",
+                 md_file, html_file, long_image_path or "(未生成)")
+
+        # 自动维护：清理过期旧输出
+        clean_old_outputs(config.output_retention_days)
+
+        # 4. 邮件发送
+        if dry_run:
+            log.info("[Dry Run 模式] 本次执行仅生成预览与长图，不发送邮件。")
+            log.info("报告字数：%d，耗时：%.1f 秒", len(report_markdown), time.perf_counter() - started_at)
+            return
+
+        log.info("正在向目标邮箱 [%s] 发送简报邮件（含高清长图附件）...", config.mail_to)
+        try:
+            send_digest_email(report_markdown, errors, image_path=long_image_path)
+            log.info("========== 简报任务成功完成！总耗时: %.1f 秒 ==========", time.perf_counter() - started_at)
+        except Exception as exc:
+            log.error("邮件发送失败: %s: %s", type(exc).__name__, exc)
+            raise exc
 
 
 def run_scheduler() -> None:
@@ -126,7 +197,7 @@ def run_scheduler() -> None:
             log.exception("定时任务执行异常")
 
     # Schedule daily job
-    schedule.every().day.at(target_time).do(job)
+    schedule.every().day.at(target_time, tz=config.digest_timezone).do(job)
 
     while True:
         schedule.run_pending()
@@ -135,11 +206,12 @@ def run_scheduler() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="每日财经与中国宏观外媒新闻抓取、总结与影响分析服务")
-    parser.add_argument("--run-now", action="store_true", help="立即执行抓取、总结并发起邮件发送")
-    parser.add_argument("--dry-run", action="store_true", help="立即执行抓取和总结，生成本地 HTML/MD 预览，不发邮件")
-    parser.add_argument("--schedule", action="store_true", help="以常驻进程模式启动内置定时任务调度器（默认每天08:00）")
-    parser.add_argument("--test-sources", action="store_true", help="仅测试七大外媒的数据源连接与抓取能力")
-    parser.add_argument("--test-mail", action="store_true", help="测试 SMTP 邮件连接并发送一封测试邮件")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--run-now", action="store_true", help="立即执行抓取、总结并发起邮件发送")
+    mode.add_argument("--dry-run", action="store_true", help="立即执行抓取和总结，生成本地 HTML/MD 预览，不发邮件")
+    mode.add_argument("--schedule", action="store_true", help="以常驻进程模式启动内置定时任务调度器（默认每天08:00）")
+    mode.add_argument("--test-sources", action="store_true", help="仅测试七大外媒的数据源连接与抓取能力")
+    mode.add_argument("--test-mail", action="store_true", help="测试 SMTP 邮件连接并发送一封测试邮件")
 
     args = parser.parse_args()
 

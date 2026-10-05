@@ -69,6 +69,9 @@ def generate_digest_image(
 
             browser.close()
 
+        if getattr(config, "compress_image", True):
+            compress_image_file(output_path)
+
         file_size_kb = output_path.stat().st_size / 1024
         log.info("高清长图生成成功！路径: %s (大小: %.1f KB)", output_path, file_size_kb)
         return output_path
@@ -76,3 +79,21 @@ def generate_digest_image(
     except Exception as exc:
         log.warning("高清长图生成失败（不影响邮件正常发送）: %s: %s", type(exc).__name__, exc)
         return None
+
+
+def compress_image_file(image_path: Path, max_size_kb: int = 2000) -> None:
+    """Optimize PNG with adaptive color quantization to reduce size while keeping text crisp."""
+    try:
+        from PIL import Image
+        if not image_path.exists():
+            return
+        orig_kb = image_path.stat().st_size / 1024
+        if orig_kb > max_size_kb:
+            with Image.open(image_path) as img:
+                quantized = img.quantize(colors=256, method=Image.Quantize.MEDIANCUT)
+                quantized.save(image_path, format="PNG", optimize=True)
+            new_kb = image_path.stat().st_size / 1024
+            log.info("长图智能压缩完成: %.1f KB -> %.1f KB (体积减小 %.1f%%)",
+                     orig_kb, new_kb, (1 - new_kb / orig_kb) * 100)
+    except Exception as e:
+        log.debug("长图压缩未执行: %s", e)

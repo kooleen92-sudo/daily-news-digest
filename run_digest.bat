@@ -6,8 +6,9 @@ cd /d "%~dp0"
 
 if not exist logs mkdir logs
 
-set "PYTHON_EXE=C:\Users\24740\AppData\Local\Programs\Python\Python312\python.exe"
-if not exist "%PYTHON_EXE%" (
+if defined DAILYNEWS_PYTHON (
+    set "PYTHON_EXE=%DAILYNEWS_PYTHON%"
+) else (
     set "PYTHON_EXE=python"
 )
 
