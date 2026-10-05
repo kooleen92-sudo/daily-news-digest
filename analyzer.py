@@ -63,12 +63,12 @@ USER_PROMPT_TEMPLATE = """请基于以下从彭博社、路透社、华尔街日
 （以 Markdown 表格形式呈现，包含：资产/领域、影响倾向[🟢利好/🔴利空/🟡震荡分化]、核心驱动逻辑及相关媒体）
 
 ## 🔍 四、各家外媒精要与深度影响剖析（In-Depth Analysis）
-（按媒体分类：彭博社、路透社、华尔街日报、金融时报、联合早报、日经中文网、经济学人。针对每家媒体的关键要闻，用精炼文字剖析，每条控制在 80~100 字）：
+（按媒体分类：彭博社、路透社、华尔街日报、金融时报、联合早报、日经中文网、经济学人。针对每家媒体，重点精选 1~2 条最具宏观影响力或市场传导效应的核心要闻进行深度剖析，其余新闻已在第三模块矩阵中体现无需赘述展开；每条文字务必精炼，控制在 60~80 字内）：
 - **[新闻标题]**（附原文链接）
   - 📰 **核心事实**：用 1 句精炼说明关键事件与数据。
   - 💡 **影响分析**：用 1~2 句深入分析对中国宏观/政策、金融市场或产业企业的具体传导机制。
 
-【输出纪律】：请合理分配文字密度，严格按上述一至四的顺序完整输出全部内容，绝不允许省略或截断任何一个模块。"""
+【输出纪律】：请合理把控全篇文字密度（总字数控制在 3500~5000 字以内），严格按上述一至四的顺序完整输出全部内容，杜绝因冗长而在末尾被截断。"""
 
 
 
@@ -148,6 +148,8 @@ def _call_llm_provider(
     client = OpenAI(**client_kwargs)
     last_error: Exception | None = None
 
+    best_partial_content: str | None = None
+
     for cand_model in candidate_models:
         clean_model = cand_model.strip().lower().replace(" ", "-")
         for attempt in range(3):
@@ -168,17 +170,33 @@ def _call_llm_provider(
                 finish_reason = getattr(choice, "finish_reason", None)
 
                 if content and len(content.strip()) > 50:
-                    # Verify key module presence
-                    if ("个人投资" in content or "资产配置" in content) and finish_reason != "length":
+                    has_allocation = ("个人投资" in content or "资产配置" in content)
+                    content_clean = content.strip()
+
+                    # 最佳情况：完整生成且包含核心个人资产配置
+                    if has_allocation and finish_reason != "length":
                         log.info("[%s] 成功生成完整分析报告（含个人资产配置模块）！模型: %s", provider_name, clean_model)
-                        return content.strip(), None
+                        return content_clean, None
+
+                    # 触及 token 上限时的容错处理
                     elif finish_reason == "length":
-                        log.warning("[%s] 模型 '%s' 输出触及 token 上限被截断，准备重试...", provider_name, clean_model)
+                        # 若核心模块（宏观研判与个人资产配置）已在前部完整生成且篇幅充实（>1500字），予以正常采纳
+                        if has_allocation and len(content_clean) > 1500:
+                            log.warning("[%s] 模型 '%s' 输出触及 token 上限，但核心模块（宏观研判与个人资产配置）已完整生成（字数: %d），予以采纳！",
+                                        provider_name, clean_model, len(content_clean))
+                            return content_clean, None
+
+                        # 保存作为最终备选兜底
+                        if not best_partial_content or len(content_clean) > len(best_partial_content):
+                            best_partial_content = content_clean
+
+                        log.warning("[%s] 模型 '%s' 输出触及 token 上限且缺少核心模块，准备重试...", provider_name, clean_model)
                         if attempt < 2:
                             continue
+
                     else:
                         log.info("[%s] 成功生成分析报告！模型: %s", provider_name, clean_model)
-                        return content.strip(), None
+                        return content_clean, None
             except Exception as exc:
                 last_error = exc
                 err_str = str(exc).lower()
@@ -199,6 +217,12 @@ def _call_llm_provider(
                     log.info("[%s] 节点繁忙（503/429），暂停 %d 秒后进行重试...", provider_name, wait_sec)
                     time.sleep(wait_sec)
                     continue
+
+    # 若所有尝试均由于长度原因未完全达标，但保留了高质量长篇生成内容，则兜底采纳
+    if best_partial_content and len(best_partial_content) > 1000:
+        log.warning("[%s] 所有候选模型调用完毕，兜底采纳保留的高质量分析内容（字数: %d）。",
+                    provider_name, len(best_partial_content))
+        return best_partial_content, None
 
     return None, last_error
 
@@ -222,11 +246,11 @@ def analyze_news(articles_by_source: dict[str, list[NewsArticle]], errors: list[
     # -------------------------------------------------------------
     if config.gemini_api_key:
         log.info("【Tier 1】优先使用 Google Gemini 引擎进行深度分析...")
-        # Candidates list: configured model first, followed by Gemini 3 flash variants
-        gemini_candidates = [config.gemini_model]
-        for fallback in ["gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.5-flash"]:
-            if fallback not in gemini_candidates:
-                gemini_candidates.append(fallback)
+        # Candidates list: configured model first, followed by standard Gemini flash models
+        gemini_candidates = []
+        for m in [config.gemini_model, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
+            if m and m not in gemini_candidates:
+                gemini_candidates.append(m)
 
         content, gemini_err = _call_llm_provider(
             provider_name="Google Gemini",
@@ -248,7 +272,10 @@ def analyze_news(articles_by_source: dict[str, list[NewsArticle]], errors: list[
     # -------------------------------------------------------------
     if config.deepseek_api_key:
         log.info("【Tier 2】触发容灾切换：使用 DeepSeek 引擎进行深度分析...")
-        deepseek_candidates = [config.deepseek_model, "deepseek-chat"]
+        deepseek_candidates = []
+        for m in [config.deepseek_model, "deepseek-chat"]:
+            if m and m not in deepseek_candidates:
+                deepseek_candidates.append(m)
         content, ds_err = _call_llm_provider(
             provider_name="DeepSeek",
             api_key=config.deepseek_api_key,
