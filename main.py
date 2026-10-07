@@ -23,9 +23,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
+import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -78,12 +80,35 @@ def clean_old_outputs(retention_days: int = 7) -> None:
                  cleaned_count, retention_days, reclaimed_bytes / (1024 * 1024))
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    '''Write UTF-8 text content atomically by writing to a temporary sibling file and replacing the target.'''
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            dir=path.parent,
+            encoding='utf-8',
+            mode='w',
+        ) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+            tmp_file.write(content)
+        os.replace(tmp_path, path)
+    except Exception:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        raise
+
+
 def save_run_status(status_data: dict[str, Any]) -> None:
     """Save structured execution status and diagnostics to output/status.json."""
     status_file = OUTPUT_DIR / "status.json"
     try:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        status_file.write_text(json.dumps(status_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_text(status_file, json.dumps(status_data, ensure_ascii=False, indent=2))
         log.info("已更新运行诊断快照: %s", status_file)
     except Exception as e:
         log.debug("写入状态快照失败: %s", e)
@@ -96,26 +121,18 @@ class SingleInstanceLock:
         self.acquired = False
 
     def __enter__(self) -> bool:
-        if self.lock_file.exists():
-            try:
-                age = time.time() - self.lock_file.stat().st_mtime
-                if age < 1800:
-                    log.warning("检测到已有任务实例正在运行 (锁文件: %s，已存在 %.0f 秒)，终止本次执行以防并发冲突。",
-                                self.lock_file.name, age)
-                    return False
-                else:
-                    log.warning("发现超过 30 分钟的残留锁文件，自动重置接管。")
-                    self.lock_file.unlink(missing_ok=True)
-            except Exception:
-                pass
         try:
             self.lock_file.parent.mkdir(parents=True, exist_ok=True)
-            self.lock_file.write_text(str(time.time()), encoding="utf-8")
+            with self.lock_file.open('x', encoding='utf-8') as handle:
+                handle.write(f"pid={os.getpid()}\nstarted_at={datetime.now(timezone.utc).isoformat()}\n")
             self.acquired = True
             return True
+        except FileExistsError:
+            log.warning("检测到已有任务实例正在运行 (锁文件: %s)，终止本次执行以防并发冲突。", self.lock_file.name)
+            return False
         except Exception as e:
-            log.warning("锁文件创建受阻: %s，继续执行", e)
-            return True
+            log.warning("锁文件创建失败: %s，终止本次执行", e)
+            return False
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.acquired:
@@ -196,6 +213,10 @@ def execute_digest(*, dry_run: bool = False) -> None:
                 "word_count": len(report_markdown),
             }
 
+            if not is_valid and not dry_run:
+                issues_summary = "; ".join(integrity_issues) if integrity_issues else "no specific issues reported"
+                raise ValueError(f"Report integrity validation failed: {issues_summary}")
+
             # 3. 本地存储预览备份与高清长图生成
             now = datetime.now(ZoneInfo(config.digest_timezone))
             date_tag = now.strftime("%Y%m%d")
@@ -204,8 +225,8 @@ def execute_digest(*, dry_run: bool = False) -> None:
             img_file = OUTPUT_DIR / f"digest_{date_tag}.png"
             
             html_content = render_html_document(report_markdown, errors)
-            md_file.write_text(report_markdown, encoding="utf-8")
-            html_file.write_text(html_content, encoding="utf-8")
+            _atomic_write_text(md_file, report_markdown)
+            _atomic_write_text(html_file, html_content)
 
             # 渲染高清长图 (2x Retina 高清分辨率)
             long_image_path = generate_digest_image(html_file, img_file)

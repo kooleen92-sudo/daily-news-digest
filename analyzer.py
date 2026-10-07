@@ -11,13 +11,15 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import os
 import re
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from openai import OpenAI
-from config import config
+from config import BASE_DIR, config
 from collector import NewsArticle
 
 log = logging.getLogger("daily-news")
@@ -156,15 +158,23 @@ def validate_report_integrity(markdown_report: str) -> tuple[bool, list[str]]:
 def compute_articles_hash(articles_by_source: dict[str, list[NewsArticle]]) -> str:
     """Calculate MD5 fingerprint of the scraped articles for idempotent caching."""
     hasher = hashlib.md5()
+    hasher.update(b"cache-schema-v2")
     for src in sorted(articles_by_source.keys()):
-        for a in articles_by_source[src]:
+        sorted_articles = sorted(
+            articles_by_source[src],
+            key=lambda a: (a.url.strip(), a.title.strip(), (a.summary or "").strip(), a.published_at.isoformat()),
+        )
+        for a in sorted_articles:
+            hasher.update(a.source.strip().encode("utf-8"))
             hasher.update(a.url.strip().encode("utf-8"))
             hasher.update(a.title.strip().encode("utf-8"))
+            hasher.update((a.summary or "").strip().encode("utf-8"))
+            hasher.update(a.published_at.isoformat().encode("utf-8"))
     return hasher.hexdigest()
 
 
 def _get_cache_path() -> Path:
-    cache_dir = Path("output")
+    cache_dir = BASE_DIR / "output"
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir / ".cache_digest.json"
 
@@ -195,7 +205,19 @@ def save_cached_analysis(articles_hash: str, report: str) -> None:
             "created_at": datetime.now().isoformat(),
             "report": report
         }
-        cache_file.write_text(json.dumps(cache_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        fd, temp_path = tempfile.mkstemp(
+            prefix=f"{cache_file.name}.",
+            suffix=".tmp",
+            dir=cache_file.parent,
+        )
+        temp_file = Path(temp_path)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(cache_data, fh, ensure_ascii=False, indent=2)
+            os.replace(temp_file, cache_file)
+        finally:
+            if temp_file.exists():
+                temp_file.unlink()
     except Exception as e:
         log.debug("写入分析缓存异常: %s", e)
 

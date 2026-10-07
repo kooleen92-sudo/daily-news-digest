@@ -596,7 +596,7 @@ def _fetch_zaobao(lookback_hours: int, max_per_source: int) -> list[NewsArticle]
 
 def _fetch_nikkei(lookback_hours: int, max_per_source: int) -> list[NewsArticle]:
     items = []
-    lookback = max(lookback_hours, 96)
+    lookback = lookback_hours
     try:
         items.extend(fetch_rss_feed(
             "日经中文网",
@@ -625,7 +625,7 @@ def _fetch_nikkei(lookback_hours: int, max_per_source: int) -> list[NewsArticle]
 
 def _fetch_economist(lookback_hours: int, max_per_source: int) -> list[NewsArticle]:
     items = []
-    lookback = max(lookback_hours, 96)
+    lookback = lookback_hours
     try:
         items.extend(fetch_rss_feed("经济学人", "https://www.economist.com/finance-and-economics/rss.xml", lookback, max_items=20, min_score=2.0))
     except Exception as e:

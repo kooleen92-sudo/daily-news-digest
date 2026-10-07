@@ -126,7 +126,7 @@ class AppConfig:
 
         # Validate LLM Providers
         providers = self.get_configured_providers()
-        if not providers:
+        if self.mail_to and not providers:
             errors.append("未检测到任何可用的 AI 模型提供商配置 (请至少配置 GEMINI_API_KEY、DEEPSEEK_API_KEY 或 OPENAI_API_KEY)")
 
         # Validate Email Settings (if mail_to is specified)
@@ -150,7 +150,19 @@ class AppConfig:
                 return default
             return val in {"1", "true", "yes", "on"}
 
-        smtp_port = int(os.getenv("SMTP_PORT", "465"))
+        def get_int(key: str, default: int) -> int:
+            try:
+                return int(os.getenv(key, str(default)))
+            except (TypeError, ValueError):
+                return default
+
+        def get_float(key: str, default: float) -> float:
+            try:
+                return float(os.getenv(key, str(default)))
+            except (TypeError, ValueError):
+                return default
+
+        smtp_port = get_int("SMTP_PORT", 465)
         default_ssl = (smtp_port == 465)
         default_tls = (smtp_port == 587)
 
@@ -190,16 +202,16 @@ class AppConfig:
         return cls(
             digest_time=os.getenv("DIGEST_TIME", "08:00").strip(),
             digest_timezone=os.getenv("DIGEST_TIMEZONE", "Asia/Shanghai").strip(),
-            lookback_hours=int(os.getenv("LOOKBACK_HOURS", "24")),
-            max_items_per_source=int(os.getenv("MAX_ITEMS_PER_SOURCE", "5")),
-            fetch_timeout=float(os.getenv("FETCH_TIMEOUT", "15.0")),
-            dedupe_similarity=float(os.getenv("DEDUPE_SIMILARITY", "0.85")),
-            output_retention_days=int(os.getenv("OUTPUT_RETENTION_DAYS", "7")),
+            lookback_hours=get_int("LOOKBACK_HOURS", 24),
+            max_items_per_source=get_int("MAX_ITEMS_PER_SOURCE", 5),
+            fetch_timeout=get_float("FETCH_TIMEOUT", 15.0),
+            dedupe_similarity=get_float("DEDUPE_SIMILARITY", 0.85),
+            output_retention_days=get_int("OUTPUT_RETENTION_DAYS", 7),
             compress_image=get_bool("COMPRESS_IMAGE", True),
             openai_api_key=openai_key,
             openai_base_url=openai_base,
             llm_model=openai_model or "gpt-4o-mini",
-            llm_timeout=float(os.getenv("LLM_TIMEOUT", "90.0")),
+            llm_timeout=get_float("LLM_TIMEOUT", 90.0),
             gemini_api_key=gemini_key,
             gemini_base_url=gemini_base,
             gemini_model=gemini_model,
@@ -218,4 +230,3 @@ class AppConfig:
 
 
 config = AppConfig.load()
-
