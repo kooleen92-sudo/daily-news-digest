@@ -55,11 +55,13 @@ def generate_digest_image(
             page = context.new_page()
 
             if isinstance(html_source, Path) or (isinstance(html_source, str) and Path(html_source).is_file()):
-                page.goto(Path(html_source).resolve().as_uri())
+                page.goto(Path(html_source).resolve().as_uri(), wait_until="load")
             else:
-                page.set_content(str(html_source), wait_until="networkidle")
+                page.set_content(str(html_source), wait_until="load")
 
-            page.wait_for_load_state("networkidle")
+            # Brief pause to ensure fonts and styles are fully painted
+            page.wait_for_timeout(100)
+
 
             # Try to screenshot the main .container card for a clean bordered aesthetic
             container = page.locator(".container")

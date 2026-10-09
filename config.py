@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -47,7 +47,7 @@ class AppConfig:
     # Dedicated DeepSeek Settings (Priority 2 / Fallback)
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com/v1"
-    deepseek_model: str = "deepseek-chat"
+    deepseek_model: str = "deepseek-v4-pro"
 
     # Email Settings
     mail_to: str = ""
@@ -63,29 +63,43 @@ class AppConfig:
     output_retention_days: int = 7
     compress_image: bool = True
 
+    # Externalized Topics & Persona Configuration (from config/topics.yaml)
+    topics_config: dict[str, Any] = field(default_factory=dict)
+
+
     def get_configured_providers(self) -> list[dict[str, Any]]:
-        """Return configured LLM providers in priority order."""
+        """Return configured LLM providers in priority order with deduplicated candidates."""
         providers = []
+
         # Tier 1: Gemini
         if self.gemini_api_key:
+            gemini_candidates = []
+            for m in [self.gemini_model, "gemini-3.8-flash", "gemini-3.1-pro", "gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.0-flash"]:
+                if m and m not in gemini_candidates:
+                    gemini_candidates.append(m)
             providers.append({
                 "name": "Google Gemini",
                 "api_key": self.gemini_api_key,
                 "base_url": self.gemini_base_url,
                 "model": self.gemini_model,
-                "candidates": [self.gemini_model, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"],
+                "candidates": gemini_candidates,
             })
+
         # Tier 2: DeepSeek
         if self.deepseek_api_key:
+            deepseek_candidates = []
+            for m in [self.deepseek_model, "deepseek-chat", "deepseek-v4-pro", "deepseek-flash", "deepseek-reasoner"]:
+                if m and m not in deepseek_candidates:
+                    deepseek_candidates.append(m)
             providers.append({
                 "name": "DeepSeek",
                 "api_key": self.deepseek_api_key,
                 "base_url": self.deepseek_base_url,
                 "model": self.deepseek_model,
-                "candidates": [self.deepseek_model, "deepseek-chat"],
+                "candidates": deepseek_candidates,
             })
+
         # Tier 3: Standard / Generic OpenAI compatible provider
-        # Active if openai_api_key is set and not identical to gemini or deepseek keys
         if self.openai_api_key:
             is_dup = (self.openai_api_key == self.gemini_api_key) or (self.openai_api_key == self.deepseek_api_key)
             if not is_dup:
@@ -131,8 +145,12 @@ class AppConfig:
 
         # Validate Email Settings (if mail_to is specified)
         if self.mail_to:
-            if "@" not in self.mail_to:
-                errors.append(f"MAIL_TO '{self.mail_to}' 邮箱格式无效")
+            recipients = self.recipient_list
+            if not recipients:
+                errors.append("MAIL_TO 未配置有效收件邮箱")
+            for addr in recipients:
+                if "@" not in addr:
+                    errors.append(f"MAIL_TO '{addr}' 邮箱格式无效")
             if not self.smtp_host:
                 errors.append("配置了 MAIL_TO，但未配置 SMTP_HOST")
             if not (1 <= self.smtp_port <= 65535):
@@ -141,6 +159,14 @@ class AppConfig:
                 errors.append("SMTP_USE_SSL 和 SMTP_USE_TLS 不能同时为 True，请根据端口选择其一 (465 通常为 SSL，587 通常为 TLS)")
 
         return errors
+
+    @property
+    def recipient_list(self) -> list[str]:
+        """Return parsed list of recipient email addresses."""
+        if not self.mail_to:
+            return []
+        return [addr.strip() for addr in re.split(r"[;,]", self.mail_to) if addr.strip()]
+
 
     @classmethod
     def load(cls) -> "AppConfig":
@@ -184,7 +210,7 @@ class AppConfig:
             openai_base if "googleapis.com" in openai_base_lower else "https://generativelanguage.googleapis.com/v1beta/openai/"
         )
         gemini_model = os.getenv("GEMINI_MODEL", "").strip() or (
-            openai_model if "gemini" in openai_model.lower() else "gemini-2.5-flash"
+            openai_model if "gemini" in openai_model.lower() else "gemini-3.8-flash"
         )
 
         # Dedicated DeepSeek configuration
@@ -196,7 +222,7 @@ class AppConfig:
             openai_base if "deepseek" in openai_base_lower else "https://api.deepseek.com/v1"
         )
         deepseek_model = os.getenv("DEEPSEEK_MODEL", "").strip() or (
-            openai_model if "deepseek" in openai_model.lower() else "deepseek-chat"
+            openai_model if "deepseek" in openai_model.lower() else "deepseek-v4-pro"
         )
 
         return cls(
@@ -226,7 +252,33 @@ class AppConfig:
             smtp_password=os.getenv("SMTP_PASSWORD", "").strip(),
             smtp_use_ssl=get_bool("SMTP_USE_SSL", default_ssl),
             smtp_use_tls=get_bool("SMTP_USE_TLS", default_tls),
+            topics_config=cls._load_topics_yaml(),
         )
 
+    @classmethod
+    def _load_topics_yaml(cls) -> dict[str, Any]:
+        """Load externalized topics.yaml if present."""
+        topics_file = BASE_DIR / "config" / "topics.yaml"
+        if topics_file.exists():
+            try:
+                import yaml
+                data = yaml.safe_load(topics_file.read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else {}
+            except Exception:
+                pass
+        return {}
 
-config = AppConfig.load()
+
+
+_cached_config: AppConfig | None = None
+
+
+def get_config(reload: bool = False) -> AppConfig:
+    """Get global cached configuration or reload from environment."""
+    global _cached_config
+    if _cached_config is None or reload:
+        _cached_config = AppConfig.load()
+    return _cached_config
+
+
+config = get_config()

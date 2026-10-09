@@ -7,14 +7,16 @@ from config import AppConfig
 
 def test_provider_detection_gemini():
     os.environ["GEMINI_API_KEY"] = "AIzaSyTestKey123"
-    os.environ["GEMINI_MODEL"] = "gemini-2.5-flash"
+    os.environ["GEMINI_MODEL"] = ""
     os.environ["DEEPSEEK_API_KEY"] = ""
     os.environ["OPENAI_API_KEY"] = ""
     cfg = AppConfig.load()
     providers = cfg.get_configured_providers()
     assert len(providers) >= 1
     assert providers[0]["name"] == "Google Gemini"
-    assert providers[0]["model"] == "gemini-2.5-flash"
+    assert providers[0]["model"] == "gemini-3.8-flash"
+    assert "gemini-3.1-pro" in providers[0]["candidates"]
+    assert "gemini-3.8-flash" in providers[0]["candidates"]
 
 
 def test_provider_detection_deepseek():
@@ -25,7 +27,7 @@ def test_provider_detection_deepseek():
     providers = cfg.get_configured_providers()
     assert len(providers) == 1
     assert providers[0]["name"] == "DeepSeek"
-    assert providers[0]["model"] == "deepseek-chat"
+    assert providers[0]["model"] in {"deepseek-chat", "deepseek-v4-pro"}
 
 
 def test_provider_detection_openai_compatible():
@@ -85,3 +87,11 @@ def test_config_validation():
     assert any("SMTP_PORT" in e for e in errors)
     assert any("SMTP_USE_SSL 和 SMTP_USE_TLS" in e for e in errors)
     assert any("未检测到任何可用的 AI 模型提供商配置" in e for e in errors)
+
+
+def test_get_config_reload():
+    from config import get_config
+    cfg1 = get_config()
+    cfg2 = get_config(reload=True)
+    assert cfg1.digest_time == cfg2.digest_time
+

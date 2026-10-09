@@ -52,3 +52,27 @@ def test_single_instance_lock_file_not_overwritten(tmp_path):
         with second_lock as second_acquired:
             assert second_acquired is False
             assert lock_file.read_text() == original_content
+
+
+def test_single_instance_lock_recovers_from_dead_pid(tmp_path):
+    lock_file = tmp_path / "test.lock"
+    # Write a lock with a nonexistent PID
+    dead_pid = 999999
+    lock_file.write_text(f"pid={dead_pid}\nstarted_at=2026-10-01T00:00:00+00:00\n", encoding="utf-8")
+
+    # A new lock should detect dead pid, reclaim the lock and acquire successfully
+    new_lock = SingleInstanceLock(lock_file)
+    with new_lock as acquired:
+        assert acquired is True
+        assert f"pid={dead_pid}" not in lock_file.read_text()
+
+
+def test_single_instance_lock_recovers_from_expired_timestamp(tmp_path):
+    lock_file = tmp_path / "test.lock"
+    # Write an expired lock timestamp (age > max_age_seconds=1)
+    lock_file.write_text(f"pid=1\nstarted_at=2020-01-01T00:00:00+00:00\n", encoding="utf-8")
+
+    new_lock = SingleInstanceLock(lock_file, max_age_seconds=1)
+    with new_lock as acquired:
+        assert acquired is True
+

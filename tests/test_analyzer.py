@@ -120,3 +120,25 @@ def test_compute_articles_hash():
 
     assert hash1 == hash2
     assert hash1 != hash3
+
+
+def test_report_disclaimer_present():
+    from prompts import REPORT_DISCLAIMER
+    assert "免责声明与风险提示" in REPORT_DISCLAIMER
+    assert "不构成任何实质性买卖建议" in REPORT_DISCLAIMER
+
+
+def test_cache_date_timezone_aware(tmp_path, monkeypatch):
+    from analyzer import save_cached_analysis, get_cached_analysis
+    from config import config
+
+    test_hash = "abcdef0123456789"
+    test_report = "## 🌟 一、今日宏观核心研判与前瞻\n内容\n## 💡 二、个人投资与大类资产配置实战指南\n内容\n| a | b |\n|---|---|\n## 📊 三、市场与资产影响速查矩阵\n内容\n## 🔍 四、各家外媒精要与深度影响剖析\n内容\n"
+
+    # Point cache dir to tmp_path
+    monkeypatch.setattr("analyzer._get_cache_path", lambda: tmp_path / ".cache_digest.json")
+
+    save_cached_analysis(test_hash, test_report)
+    loaded = get_cached_analysis(test_hash)
+    assert loaded == test_report
+

@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sys
 import tempfile
@@ -44,16 +45,33 @@ from collector import collect_all_sources
 from analyzer import analyze_news, validate_report_integrity
 from mailer import send_digest_email, render_html_document, test_smtp_connection
 from image_generator import generate_digest_image
+from market_data import fetch_market_snapshot, render_market_table
+from seen_history import filter_cross_day_duplicates, record_pushed_articles
+from article_extractor import enrich_top_articles
+from notifier import dispatch_webhooks
+from archive_manager import archive_daily_digest, generate_archive_portal, generate_rss_feed
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 LOGS_DIR = Path(__file__).resolve().parent / "logs"
 
+
+# Setup dual logging: stdout + persistent rotating file handler
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+log_file_path = LOGS_DIR / "daily_news.log"
+file_handler = RotatingFileHandler(
+    log_file_path,
+    maxBytes=5 * 1024 * 1024,  # 5MB
+    backupCount=3,
+    encoding="utf-8"
+)
+file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout)
-    ]
+    handlers=[stream_handler, file_handler]
 )
 log = logging.getLogger("daily-news")
 
@@ -81,7 +99,7 @@ def clean_old_outputs(retention_days: int = 7) -> None:
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
-    '''Write UTF-8 text content atomically by writing to a temporary sibling file and replacing the target.'''
+    """Write UTF-8 text content atomically by writing to a temporary sibling file and replacing the target."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = None
     try:
@@ -114,25 +132,95 @@ def save_run_status(status_data: dict[str, Any]) -> None:
         log.debug("写入状态快照失败: %s", e)
 
 
+def _is_pid_alive(pid: int) -> bool:
+    """Check if a process with given PID is still active."""
+    if pid <= 0:
+        return False
+    try:
+        if os.name == "nt":
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True
+            return False
+        else:
+            os.kill(pid, 0)
+            return True
+    except (OSError, ProcessLookupError, PermissionError):
+        return False
+
+
 class SingleInstanceLock:
-    """Simple file-based lock to prevent overlapping scheduled/manual runs."""
-    def __init__(self, lock_file: Path):
+    """
+    File-based lock with stale-lock detection and automatic recovery.
+    Prevents overlapping scheduled/manual runs while recovering gracefully from crashes.
+    """
+    def __init__(self, lock_file: Path, max_age_seconds: int = 7200):
         self.lock_file = lock_file
+        self.max_age_seconds = max_age_seconds
         self.acquired = False
 
-    def __enter__(self) -> bool:
+    def _check_and_clean_stale_lock(self) -> bool:
+        """Return True if lock file was stale and successfully cleaned."""
+        if not self.lock_file.exists():
+            return False
         try:
-            self.lock_file.parent.mkdir(parents=True, exist_ok=True)
-            with self.lock_file.open('x', encoding='utf-8') as handle:
-                handle.write(f"pid={os.getpid()}\nstarted_at={datetime.now(timezone.utc).isoformat()}\n")
-            self.acquired = True
-            return True
-        except FileExistsError:
-            log.warning("检测到已有任务实例正在运行 (锁文件: %s)，终止本次执行以防并发冲突。", self.lock_file.name)
-            return False
+            content = self.lock_file.read_text(encoding="utf-8").strip()
+            pid = None
+            started_at = None
+            for line in content.splitlines():
+                if line.startswith("pid="):
+                    pid = int(line.split("=", 1)[1].strip())
+                elif line.startswith("started_at="):
+                    started_at = datetime.fromisoformat(line.split("=", 1)[1].strip())
+
+            now = datetime.now(timezone.utc)
+            is_stale = False
+            reason = ""
+
+            # Check age
+            if started_at:
+                age_seconds = (now - started_at).total_seconds()
+                if age_seconds > self.max_age_seconds:
+                    is_stale = True
+                    reason = f"超时 (已存活 {int(age_seconds)} 秒 > {self.max_age_seconds} 秒)"
+
+            # Check pid liveness if not already deemed stale
+            if not is_stale and pid:
+                if not _is_pid_alive(pid):
+                    is_stale = True
+                    reason = f"持有锁的进程 (PID: {pid}) 已终止"
+
+            if is_stale:
+                log.warning("检测到孤儿锁文件 (%s，原因: %s)，自动回收并继续执行。", self.lock_file.name, reason)
+                self.lock_file.unlink(missing_ok=True)
+                return True
+
         except Exception as e:
-            log.warning("锁文件创建失败: %s，终止本次执行", e)
-            return False
+            log.debug("读取锁文件诊断信息异常: %s", e)
+
+        return False
+
+    def __enter__(self) -> bool:
+        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
+
+        for attempt in range(2):
+            try:
+                with self.lock_file.open('x', encoding='utf-8') as handle:
+                    handle.write(f"pid={os.getpid()}\nstarted_at={datetime.now(timezone.utc).isoformat()}\n")
+                self.acquired = True
+                return True
+            except FileExistsError:
+                if attempt == 0 and self._check_and_clean_stale_lock():
+                    continue  # cleaned stale lock, try acquiring again
+                log.warning("检测到已有活跃任务实例正在运行 (锁文件: %s)，终止本次执行以防并发冲突。", self.lock_file.name)
+                return False
+            except Exception as e:
+                log.warning("锁文件创建失败: %s，终止本次执行", e)
+                return False
+        return False
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.acquired:
@@ -186,13 +274,28 @@ def execute_digest(*, dry_run: bool = False) -> None:
             log.info("当前有效 AI 分析引擎链: %s", p_desc)
             status_record["configured_providers"] = [p["name"] for p in providers]
 
-            # 1. 抓取七大权威外媒（并发并行抓取）
+            # 1. 抓取实时宏观与大类资产行情快照
+            log.info("正在获取全球大类资产与宏观行情快照（A股基准、恒指、美股大盘、黄金ETF、离岸人民币）...")
+            market_quotes = fetch_market_snapshot(timeout=config.fetch_timeout)
+            if market_quotes:
+                log.info("成功获取 %d 项实时资产与宏观行情指标", len(market_quotes))
+                status_record["market_quotes_count"] = len(market_quotes)
+
+            # 2. 抓取七大权威外媒（并发并行抓取）
             log.info("正在并发抓取七大外媒（彭博社、路透社、华尔街日报、金融时报、联合早报、日经中文网、经济学人）...")
             articles_by_source, errors = collect_all_sources(
                 lookback_hours=config.lookback_hours,
                 max_per_source=config.max_items_per_source
             )
-            
+
+            # 3. 跨日去重引擎：过滤往期已报道新闻，防止连续多日信息冗余
+            articles_by_source, removed_hist = filter_cross_day_duplicates(articles_by_source)
+            status_record["cross_day_duplicates_removed"] = removed_hist
+
+            # 4. 深度正文抽取：为高分核心要闻拉取实质性正文，充实分析事实依据
+            enriched_count = enrich_top_articles(articles_by_source, top_n=8)
+            status_record["enriched_articles_count"] = enriched_count
+
             total_articles = sum(len(v) for v in articles_by_source.values())
             status_record["sources_scraped"] = {src: len(items) for src, items in articles_by_source.items()}
             status_record["total_articles"] = total_articles
@@ -203,9 +306,9 @@ def execute_digest(*, dry_run: bool = False) -> None:
             if errors:
                 log.warning("抓取遇到以下告警: %s", "；".join(errors))
 
-            # 2. 深度分析与影响剖析
+            # 5. 深度分析与影响剖析（结合实时行情与资产配置指引）
             log.info("正在生成财经与中国宏观深度分析报告...")
-            report_markdown = analyze_news(articles_by_source, errors)
+            report_markdown = analyze_news(articles_by_source, errors, market_quotes=market_quotes)
             is_valid, integrity_issues = validate_report_integrity(report_markdown)
             status_record["report_validation"] = {
                 "is_valid": is_valid,
@@ -213,17 +316,18 @@ def execute_digest(*, dry_run: bool = False) -> None:
                 "word_count": len(report_markdown),
             }
 
-            if not is_valid and not dry_run:
+            is_fallback = ("未启用大模型智能分析兜底模式" in report_markdown)
+            if not is_valid and not dry_run and not is_fallback:
                 issues_summary = "; ".join(integrity_issues) if integrity_issues else "no specific issues reported"
                 raise ValueError(f"Report integrity validation failed: {issues_summary}")
 
-            # 3. 本地存储预览备份与高清长图生成
+            # 6. 本地存储预览备份与高清长图生成
             now = datetime.now(ZoneInfo(config.digest_timezone))
             date_tag = now.strftime("%Y%m%d")
             md_file = OUTPUT_DIR / f"digest_{date_tag}.md"
             html_file = OUTPUT_DIR / f"digest_{date_tag}.html"
             img_file = OUTPUT_DIR / f"digest_{date_tag}.png"
-            
+
             html_content = render_html_document(report_markdown, errors)
             _atomic_write_text(md_file, report_markdown)
             _atomic_write_text(html_file, html_content)
@@ -237,23 +341,62 @@ def execute_digest(*, dry_run: bool = False) -> None:
             log.info("已生成本地文件：\n  - Markdown: %s\n  - HTML: %s\n  - Long Image: %s",
                      md_file, html_file, long_image_path or "(未生成)")
 
+            # 7. 永久归档、门户索引更新与 RSS 2.0 订阅源生成
+            archive_daily_digest(report_markdown, html_content, date_tag, image_path=long_image_path)
+            generate_archive_portal()
+            generate_rss_feed()
+
             # 自动维护：清理过期旧输出
             clean_old_outputs(config.output_retention_days)
 
-            # 4. 邮件发送
+            # 8. 邮件发送与多渠道 Webhook 协同通知（先完成归档与输出，再做投递）
             if dry_run:
-                log.info("[Dry Run 模式] 本次执行仅生成预览与长图，不发送邮件。")
+                log.info("[Dry Run 模式] 本次执行仅生成预览、长图与历史归档，不发送邮件与通知，也不记录已推送文章库。")
                 status_record["overall_status"] = "SUCCESS_DRY_RUN"
                 return
 
-            log.info("正在向目标邮箱 [%s] 发送简报邮件（含高清长图附件）...", config.mail_to)
-            send_digest_email(report_markdown, errors, image_path=long_image_path)
-            status_record["email_sent"] = True
+            email_success = False
+            recipients = config.recipient_list
+            if recipients:
+                log.info("正在向目标邮箱 [%s] 发送简报邮件（含高清长图附件）...", ", ".join(recipients))
+                try:
+                    send_digest_email(report_markdown, errors, image_path=long_image_path)
+                    email_success = True
+                    status_record["email_sent"] = True
+                except Exception as mail_err:
+                    log.error("邮件发送异常: %s", mail_err)
+                    errors.append(f"邮件发送失败: {mail_err}")
+
+            # 9. 多渠道 Webhook 协同推送 (企业微信 / 飞书 / 钉钉 / Server酱 / Telegram)
+            digest_title = f"【每日财经与中国宏观深度简报】{now.strftime('%Y-%m-%d')}"
+            webhook_results = dispatch_webhooks(digest_title, report_markdown)
+            if webhook_results:
+                status_record["webhooks_dispatched"] = webhook_results
+
+            webhook_success = bool(webhook_results) and any(bool(v) for v in webhook_results.values())
+            delivery_success = bool(email_success or webhook_success)
+
+            if not delivery_success:
+                failure_detail = "所有投递渠道均未成功（邮件: %s；Webhook: %s）" % (
+                    "已配置但发送失败" if recipients else "未配置收件人",
+                    "已配置但推送失败" if webhook_results else "未配置",
+                )
+                status_record["overall_status"] = "DELIVERY_FAILED"
+                status_record["delivery_failure_reason"] = failure_detail
+                log.error("❌ 简报投递失败：%s", failure_detail)
+                raise RuntimeError(f"Digest delivery failed: {failure_detail}")
+
+            # 10. 仅在非 dry-run 且至少一个投递渠道成功后，记录已推送文章库以供后续跨日去重
+            record_pushed_articles(articles_by_source, is_dry_run=False)
             status_record["overall_status"] = "SUCCESS"
+
             log.info("========== 简报任务成功完成！总耗时: %.1f 秒 ==========", time.perf_counter() - started_at)
 
+
         except Exception as exc:
-            status_record["overall_status"] = "FAILED"
+            # 保留投递失败终态，避免被通用异常处理覆盖
+            if status_record["overall_status"] != "DELIVERY_FAILED":
+                status_record["overall_status"] = "FAILED"
             status_record["failure_reason"] = f"{type(exc).__name__}: {exc}"
             log.error("简报任务执行失败: %s: %s", type(exc).__name__, exc)
             raise exc
@@ -277,7 +420,6 @@ def run_scheduler() -> None:
         except Exception:
             log.exception("定时任务执行异常")
 
-    # Schedule daily job
     schedule.every().day.at(target_time, tz=config.digest_timezone).do(job)
 
     while True:
@@ -299,20 +441,19 @@ def main() -> None:
     if args.test_sources:
         log.info("正在测试七大权威外媒连接...")
         articles_by_source, errors = collect_all_sources(lookback_hours=24, max_per_source=3)
-        print("\n" + "="*50)
-        print("七大权威外媒连接测试结果：")
-        print("="*50)
+        separator = "=" * 50
+        log.info("\n%s\n七大权威外媒连接测试结果：\n%s", separator, separator)
         for src, items in articles_by_source.items():
             status = "✅ 正常" if items else "❌ 暂无条目"
-            print(f"[{src}] {status} - 抓取到 {len(items)} 条新闻：")
+            log.info("[%s] %s - 抓取到 %d 条新闻：", src, status, len(items))
             for idx, a in enumerate(items, 1):
-                print(f"   {idx}. {a.title} ({a.published_at.strftime('%Y-%m-%d %H:%M')})")
-                print(f"      链接: {a.url}")
+                log.info("   %d. %s (%s)", idx, a.title, a.published_at.strftime('%Y-%m-%d %H:%M'))
+                log.info("      链接: %s", a.url)
         if errors:
-            print("\n告警信息：")
+            log.warning("\n告警信息：")
             for err in errors:
-                print(f" - {err}")
-        print("="*50 + "\n")
+                log.warning(" - %s", err)
+        log.info("%s\n", separator)
         return
 
     if args.test_mail:
@@ -346,7 +487,6 @@ def main() -> None:
         run_scheduler()
         return
 
-    # If no argument passed, show help
     parser.print_help()
 
 

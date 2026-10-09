@@ -12,6 +12,11 @@ permissions:
   actions: read
   contents: read
 
+concurrency:
+  # 同一 workflow/ref 串行执行；备用触发会排队等待，避免主触发和备用触发并行导致重复发送
+  group: daily-digest-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-and-send:
     runs-on: ubuntu-latest
@@ -25,12 +30,26 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
-      - name: Install System Fonts & Dependencies
+      - name: Install System Fonts & Python Dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y fonts-noto-cjk fonts-wqy-zenhei fonts-wqy-microhei
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+
+      - name: Cache Playwright Browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Playwright Browsers
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: python -m playwright install --with-deps chromium
+
+      - name: Install Playwright System Dependencies
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: python -m playwright install-deps chromium
 
       - name: Check If Already Sent Today (Idempotency Guard)
         id: check_sent
@@ -52,6 +71,16 @@ jobs:
           echo "今日尚未成功发送，正常启动抓取与研报推送流程。"
           echo "already_sent=false" >> $GITHUB_OUTPUT
 
+      - name: Restore Digest History and Archive
+        uses: actions/cache@v4
+        with:
+          path: |
+            output/seen_history.json
+            archive
+          key: digest-history-${{ github.run_id }}
+          restore-keys: |
+            digest-history-
+
       - name: Run Daily News & Impact Digest
         if: steps.check_sent.outputs.already_sent != 'true'
         env:
@@ -71,6 +100,14 @@ jobs:
           SMTP_USE_SSL: ${{ secrets.SMTP_USE_SSL }}
           SMTP_USE_TLS: ${{ secrets.SMTP_USE_TLS }}
 
+          # 多渠道通知 Webhook
+          WECOM_WEBHOOK_URL: ${{ secrets.WECOM_WEBHOOK_URL }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          DINGTALK_WEBHOOK_URL: ${{ secrets.DINGTALK_WEBHOOK_URL }}
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
           # 多引擎智能调度配置
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}
@@ -83,6 +120,7 @@ jobs:
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
         run: |
           python main.py --run-now
+
 
       - name: Archive Generated Digest
         uses: actions/upload-artifact@v4

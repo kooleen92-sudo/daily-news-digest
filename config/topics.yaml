@@ -1,0 +1,43 @@
+# -*- coding: utf-8 -*-
+# 每日财经与中国宏观深度简报关注主题、打分偏好与个人投资者画像配置
+
+persona:
+  target_audience: "中国个人投资者与家庭资产配置决策者"
+  risk_profile: "稳健进取型，注重跨市场大类资产配置与回撤控制"
+  primary_assets:
+    - "A股核心资产（沪深300 ETF / 中证A500 ETF / 双创科技 / 高股息红利）"
+    - "全球多元QDII（纳指100 ETF / 标普500 ETF / 全球半导体芯片）"
+    - "贵金属与避险资产（黄金ETF / 银行积存金）"
+    - "防御安全垫（纯债基金 / 现金理财）"
+
+scoring_weights:
+  tier1_china_title: 6.0
+  tier1_china_summary: 2.5
+  tier2_macro_title: 4.5
+  tier2_macro_summary: 2.0
+  tier3_market_title: 3.0
+  tier3_market_summary: 1.5
+  tier4_business_title: 1.0
+  tier4_business_summary: 0.5
+  noise_penalty_title: 25.0
+  noise_penalty_summary: 15.0
+
+custom_keywords:
+  tier1_china:
+    - "新质生产力"
+    - "自主可控"
+    - "市值管理"
+    - "并购六条"
+    - "一揽子增量政策"
+  tier2_macro:
+    - "降准"
+    - "降息"
+    - "逆回购"
+    - "流动性合理充裕"
+    - "实际利率"
+  tier3_markets:
+    - "高股息"
+    - "红利低波"
+    - "科创50"
+    - "创业板指"
+    - "恒生科技"

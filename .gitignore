@@ -14,6 +14,8 @@ venv/
 # Logs and outputs
 logs/
 output/
+archive/
+seen_history.json
 # Tests and caches
 /test_*.py
 .pytest_cache/

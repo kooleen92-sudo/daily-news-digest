@@ -23,9 +23,9 @@ import logging
 import re
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, List, Set, Tuple
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 from bs4 import BeautifulSoup
 import feedparser
@@ -64,6 +64,14 @@ class NewsArticle:
     category: str = "财经/中国"  # 分类标签
     language: str = "zh"    # zh or en
     relevance_score: float = 0.0  # 主题契合度得分（宏观财经与中国核心要闻）
+
+
+@dataclass(frozen=True)
+class FeedSpec:
+    url: str
+    min_score: float = 2.0
+    category: str = "财经/中国"
+    max_items: int = 20
 
 
 def clean_text(raw_text: str, max_length: int = 1000) -> str:
@@ -118,19 +126,10 @@ def parse_feed_datetime(entry: Any) -> datetime | None:
     return None
 
 
-def _contains_keyword(text: str, keyword: str) -> bool:
-    """Match Chinese phrases or complete English words, avoiding substring noise."""
-    if any("\u4e00" <= ch <= "\u9fff" for ch in keyword):
-        return keyword in text
-    return re.search(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", text) is not None
-
-
 # ---------------------------------------------------------------------------
 # Whitelist, Blacklist & Multi-tiered Relevance Scoring Engine
 # ---------------------------------------------------------------------------
 
-# Negative / Noise keywords that should be penalized or eliminated
-# Entertainment, pop music, movies, celebrities, TV streaming, sports tournaments, local crime/accidents
 NEGATIVE_KEYWORDS = [
     # English entertainment & pop culture
     "tubi", "streaming service", "netflix", "hulu", "disney+", "box office", "hollywood",
@@ -151,7 +150,6 @@ NEGATIVE_KEYWORDS = [
     "持刀伤人", "凶杀案", "绑架案", "车祸身亡", "入室抢劫"
 ]
 
-# Tier 1: Mainland China Economy, Policy, Geopolitics & Tech Champions (Title: +6.0, Summary: +2.5)
 TIER1_CHINA_KEYWORDS = [
     # Core institutions & leaders
     "china", "chinese", "beijing", "shanghai", "pboc", "xi jinping", "state council",
@@ -169,7 +167,6 @@ TIER1_CHINA_KEYWORDS = [
     "中方", "中美", "涉华"
 ]
 
-# Tier 2: Global Macroeconomics, Monetary Policy & Sovereign Debt (Title: +4.5, Summary: +2.0)
 TIER2_MACRO_KEYWORDS = [
     # Central banks & monetary policy
     "federal reserve", "fed", "ecb", "bank of japan", "boj", "bank of england",
@@ -181,37 +178,93 @@ TIER2_MACRO_KEYWORDS = [
     "fiscal deficit", "tariff", "trade war", "sanction", "de-dollarization", "debt",
     # Chinese terms
     "美联储", "欧洲央行", "日本央行", "英国央行", "中央银行", "降息", "加息", "基准利率",
-    "货币政策", "量化宽松", "通胀", "通货膨胀", "通货紧缩", "cpi", "ppi", "gdp", "经济衰退",
-    "失业率", "非农", "非农就业", "国债收益率", "美债", "主权债务", "债务违约", "债务",
-    "财政赤字", "赤字", "贸易逆差", "关税", "贸易战", "制裁", "去美元化", "房贷利率", "贴息",
+    "货币政策", "量化宽松", "通胀", "通货膨胀", "通货紧缩", "经济衰退",
+    "失业率", "非农", "非农就业", "国债收益率", "美债", "主权债务", "债务违约",
+    "财政赤字", "赤字", "贸易逆差", "贸易战", "制裁", "去美元化", "房贷利率", "贴息",
     "存款准备金率", "评级", "信用评级"
 ]
 
-# Tier 3: Major Financial Markets, Strategic Commodities & Tech Supply Chains (Title: +3.0, Summary: +1.5)
 TIER3_MARKET_KEYWORDS = [
     # Markets & Commodities
     "wall street", "s&p 500", "nasdaq", "dow jones", "nikkei", "ftse", "dax",
     "stock market", "bond market", "crude oil", "oil", "brent", "wti", "opec",
     "gold", "gold price", "silver", "copper", "dollar index", "dxy", "dollar", "forex", "fx",
     # Tech chips & AI infra
-    "semiconductor", "chip export", "chipmaker", "asml", "tsmc", "nvidia", "ai chip", "ai",
+    "semiconductor", "chip export", "chipmaker", "asml", "tsmc", "nvidia", "ai chip",
     "gpu", "data center", "artificial intelligence", "generative ai", "large language model",
     # Chinese terms
     "华尔街", "美股", "标普500", "标普", "纳斯达克", "纳指", "道琼斯", "日经指数", "日经",
-    "股市", "债市", "原油", "石油", "布伦特", "wti", "欧佩克", "opec", "黄金", "白银",
+    "股市", "债市", "原油", "石油", "布伦特", "欧佩克", "黄金", "白银",
     "铜价", "大宗商品", "美元指数", "美元", "外汇", "汇率", "半导体", "芯片", "光刻机",
     "台积电", "英伟达", "算力", "数据中心", "人工智能", "大模型", "生成式ai", "ai"
 ]
 
-# Tier 4: General Business, Finance & Corporate Actions (Title: +1.0, Summary: +0.5)
 TIER4_BUSINESS_KEYWORDS = [
     "economy", "economic", "market", "markets", "trade", "investment", "investor", "capital",
     "earnings", "revenue", "profit", "ipo", "bank", "banking", "finance", "financial",
     "stock", "stocks", "bond", "bonds", "asset management", "hedge fund", "private equity",
     "merger", "acquisition",
     "经济", "市场", "贸易", "投资", "投资者", "资本", "财报", "营收", "利润", "净利润",
-    "ipo", "上市", "挂牌", "银行", "金融", "资产管理", "对冲基金", "私募", "并购", "重组", "回购"
+    "上市", "挂牌", "银行", "金融", "资产管理", "对冲基金", "私募", "并购", "重组", "回购"
 ]
+
+
+def _compile_keyword_matcher(keywords: list[str]) -> tuple[list[str], re.Pattern | None]:
+    """
+    Split keywords into Chinese substrings and precompiled boundary-aware English regex.
+    Deduplicates and optimizes matching speed.
+    """
+    seen = set()
+    chinese_list: list[str] = []
+    english_list: list[str] = []
+
+    for kw in keywords:
+        cleaned = kw.strip().lower()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        if any("\u4e00" <= ch <= "\u9fff" for ch in cleaned):
+            chinese_list.append(cleaned)
+        else:
+            english_list.append(cleaned)
+
+    # Sort longer keywords first for regex alternation
+    english_list.sort(key=len, reverse=True)
+    regex_pattern = None
+    if english_list:
+        sub_pattern = "|".join(re.escape(k) for k in english_list)
+        regex_pattern = re.compile(rf"(?<![a-z0-9])(?:{sub_pattern})(?![a-z0-9])", re.IGNORECASE)
+
+    return chinese_list, regex_pattern
+
+
+# Merge custom keywords from config/topics.yaml if configured
+_custom_kw = getattr(config, "topics_config", {}).get("custom_keywords", {})
+_extra_t1 = _custom_kw.get("tier1_china", []) if isinstance(_custom_kw, dict) else []
+_extra_t2 = _custom_kw.get("tier2_macro", []) if isinstance(_custom_kw, dict) else []
+_extra_t3 = _custom_kw.get("tier3_markets", []) if isinstance(_custom_kw, dict) else []
+
+# Precompiled matchers for high-throughput relevance evaluation
+_NEG_ZH, _NEG_EN = _compile_keyword_matcher(NEGATIVE_KEYWORDS)
+_TIER1_ZH, _TIER1_EN = _compile_keyword_matcher(TIER1_CHINA_KEYWORDS + _extra_t1)
+_TIER2_ZH, _TIER2_EN = _compile_keyword_matcher(TIER2_MACRO_KEYWORDS + _extra_t2)
+_TIER3_ZH, _TIER3_EN = _compile_keyword_matcher(TIER3_MARKET_KEYWORDS + _extra_t3)
+_TIER4_ZH, _TIER4_EN = _compile_keyword_matcher(TIER4_BUSINESS_KEYWORDS)
+
+
+
+def _contains_keyword(text: str, keyword: str) -> bool:
+    """Match Chinese phrases or complete English words, avoiding substring noise."""
+    if any("\u4e00" <= ch <= "\u9fff" for ch in keyword):
+        return keyword in text
+    return re.search(rf"(?<![a-z0-9]){re.escape(keyword)}(?![a-z0-9])", text) is not None
+
+
+def _check_match(text_lower: str, zh_list: list[str], en_pattern: re.Pattern | None) -> bool:
+    """Fast check whether text matches any Chinese substring or English regex."""
+    if en_pattern and en_pattern.search(text_lower):
+        return True
+    return any(zh in text_lower for zh in zh_list)
 
 
 def calculate_relevance_score(title: str, summary: str, source: str = "") -> float:
@@ -223,43 +276,60 @@ def calculate_relevance_score(title: str, summary: str, source: str = "") -> flo
     t = title.lower()
     s = summary.lower()
 
-    neg_in_title = any(_contains_keyword(t, k) for k in NEGATIVE_KEYWORDS)
-    neg_in_summary = any(_contains_keyword(s, k) for k in NEGATIVE_KEYWORDS)
-
     score = 0.0
 
     # Tier 1 (China)
-    for k in TIER1_CHINA_KEYWORDS:
-        if _contains_keyword(t, k):
+    for k in _TIER1_ZH:
+        if k in t:
             score += 6.0
-        elif _contains_keyword(s, k):
+        elif k in s:
+            score += 2.5
+    if _TIER1_EN:
+        for m in _TIER1_EN.finditer(t):
+            score += 6.0
+        for m in _TIER1_EN.finditer(s):
             score += 2.5
 
     # Tier 2 (Macroeconomics & Central Banks)
-    for k in TIER2_MACRO_KEYWORDS:
-        if _contains_keyword(t, k):
+    for k in _TIER2_ZH:
+        if k in t:
             score += 4.5
-        elif _contains_keyword(s, k):
+        elif k in s:
+            score += 2.0
+    if _TIER2_EN:
+        for m in _TIER2_EN.finditer(t):
+            score += 4.5
+        for m in _TIER2_EN.finditer(s):
             score += 2.0
 
     # Tier 3 (Markets, Commodities, AI Infra)
-    for k in TIER3_MARKET_KEYWORDS:
-        if _contains_keyword(t, k):
+    for k in _TIER3_ZH:
+        if k in t:
             score += 3.0
-        elif _contains_keyword(s, k):
+        elif k in s:
+            score += 1.5
+    if _TIER3_EN:
+        for m in _TIER3_EN.finditer(t):
+            score += 3.0
+        for m in _TIER3_EN.finditer(s):
             score += 1.5
 
     # Tier 4 (General Business)
-    for k in TIER4_BUSINESS_KEYWORDS:
-        if _contains_keyword(t, k):
+    for k in _TIER4_ZH:
+        if k in t:
             score += 1.0
-        elif _contains_keyword(s, k):
+        elif k in s:
+            score += 0.5
+    if _TIER4_EN:
+        for m in _TIER4_EN.finditer(t):
+            score += 1.0
+        for m in _TIER4_EN.finditer(s):
             score += 0.5
 
     # Penalize entertainment / sports / crime noise
-    if neg_in_title:
+    if _check_match(t, _NEG_ZH, _NEG_EN):
         score -= 25.0
-    elif neg_in_summary:
+    elif _check_match(s, _NEG_ZH, _NEG_EN):
         score -= 15.0
 
     return round(score, 2)
@@ -281,7 +351,7 @@ def fetch_rss_feed(
     """Fetch and parse standard RSS feed, scoring and filtering articles by relevance."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
     articles: list[NewsArticle] = []
-    
+
     try:
         content = http_get(url, timeout=config.fetch_timeout)
         parsed = feedparser.parse(content)
@@ -296,10 +366,10 @@ def fetch_rss_feed(
             ).strip()
             link = str(entry.get("link", "")).strip()
             summary = clean_text(entry.get("summary") or entry.get("description") or "", 800)
-            
+
             if not title or not link:
                 continue
-                
+
             pub_date = parse_feed_datetime(entry)
             if pub_date is None:
                 log.debug("Skipping undated RSS item from %s: %s", source_name, title)
@@ -312,7 +382,7 @@ def fetch_rss_feed(
             if force_relevant and score < min_score:
                 log.debug("Skipping low relevance item [%.1f < %.1f] from %s: %s", score, min_score, source_name, title)
                 continue
-                
+
             articles.append(NewsArticle(
                 source=source_name,
                 title=title,
@@ -323,10 +393,10 @@ def fetch_rss_feed(
                 language="zh" if any("\u4e00" <= ch <= "\u9fff" for ch in title) else "en",
                 relevance_score=score
             ))
-            
+
             if len(articles) >= max_items:
                 break
-                
+
     except Exception as exc:
         log.warning("Failed to fetch RSS [%s] from %s: %s", source_name, url, exc)
         raise exc
@@ -339,60 +409,56 @@ def fetch_zaobao_direct(lookback_hours: int = 24, max_items: int = 10) -> list[N
     articles: list[NewsArticle] = []
     seen_links: set[str] = set()
     cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-    
+
     sections = [
         ("https://www.zaobao.com.sg/news/china", "联合早报·中国"),
         ("https://www.zaobao.com.sg/finance/china", "联合早报·财经"),
     ]
-    
-    for section_url, section_name in sections:
+
+    for section_url, _ in sections:
         try:
             html_bytes = http_get(section_url, timeout=config.fetch_timeout)
             soup = BeautifulSoup(html_bytes.decode("utf-8", errors="ignore"), "html.parser")
-            
-            # Find story links like /news/china/story20260929-9756572
+
             for a in soup.find_all("a", href=True):
                 href = a["href"].strip()
                 if not re.search(r"/(news/china|finance)/story\d+-\d+", href):
                     continue
-                    
+
                 full_url = urllib.parse.urljoin("https://www.zaobao.com.sg", href)
                 if full_url in seen_links:
                     continue
-                    
+
                 title = clean_text(a.get_text(strip=True), 200)
                 if len(title) < 6:
                     continue
-                    
+
                 seen_links.add(full_url)
-                
-                # Extract date from URL slug if available (e.g. story20260929-...)
+
                 date_match = re.search(r"story(\d{4})(\d{2})(\d{2})-", href)
                 if date_match:
                     year, month, day = map(int, date_match.groups())
-                    pub_date = datetime(year, month, day, tzinfo=ZoneInfo("Asia/Singapore")).astimezone(timezone.utc)
+                    pub_date = datetime(year, month, day, 23, 59, 59, tzinfo=ZoneInfo("Asia/Singapore")).astimezone(timezone.utc)
                 else:
-                    # Do not turn an undated page card into a fresh article.
                     continue
+
 
                 if pub_date < cutoff:
                     continue
 
-                # Calculate relevance score for the article
                 score = calculate_relevance_score(title, "", "联合早报")
                 if score < 0.5:
                     continue
-                    
-                # We can fetch snippet from parent card text if available
+
                 card_text = ""
                 parent = a.find_parent(["div", "article", "li"])
                 if parent:
                     card_text = clean_text(parent.get_text(), 400)
                     if title in card_text:
                         card_text = card_text.replace(title, "").strip()
-                
+
                 summary = card_text if card_text else title
-                
+
                 articles.append(NewsArticle(
                     source="联合早报",
                     title=title,
@@ -403,12 +469,12 @@ def fetch_zaobao_direct(lookback_hours: int = 24, max_items: int = 10) -> list[N
                     language="zh",
                     relevance_score=score
                 ))
-                
+
                 if len(articles) >= max_items:
                     break
         except Exception as e:
             log.warning("Zaobao direct scrape failed for %s: %s", section_url, e)
-            
+
     return articles
 
 
@@ -423,49 +489,125 @@ def deduplicate_articles(articles: list[NewsArticle], similarity_threshold: floa
     unique_articles: list[NewsArticle] = []
     seen_urls: set[str] = set()
     seen_titles: list[str] = []
-    
+
     # Sort by relevance_score descending, then published_at descending
     for item in sorted(articles, key=lambda a: (a.relevance_score, a.published_at), reverse=True):
         clean_url = normalize_url(item.url)
         if clean_url in seen_urls:
             continue
-            
-        # Clean title key (alphanumeric only)
+
         title_key = "".join(ch for ch in item.title.lower() if ch.isalnum())
         if not title_key:
             continue
-            
-        # Compare with seen titles
+
         is_dup = False
         for seen in seen_titles:
             if len(title_key) >= 10 and len(seen) >= 10:
                 matcher = difflib.SequenceMatcher(None, title_key, seen)
                 if matcher.ratio() >= similarity_threshold:
-                    # check opcodes: if replace exists, consider different
-                    if all(tag != "replace" for tag, *_ in matcher.get_opcodes()):
+                    # Guard against false deduplication of antonym polarity (e.g. 涨 vs 跌)
+                    opposite_pairs = [("涨", "跌"), ("升", "降"), ("增", "减"), ("牛", "熊"), ("利好", "利空")]
+                    is_opposite = any(
+                        ((pos in title_key and neg in seen) or (neg in title_key and pos in seen))
+                        and not (pos in title_key and pos in seen)
+                        and not (neg in title_key and neg in seen)
+                        for pos, neg in opposite_pairs
+                    )
+                    if not is_opposite:
                         is_dup = True
                         break
-                        
+
         if is_dup:
             continue
-            
+
         seen_urls.add(clean_url)
         seen_titles.append(title_key)
         unique_articles.append(item)
-        
+
     return unique_articles
+
+
+# ---------------------------------------------------------------------------
+# Declarative Media Feed Specifications
+# ---------------------------------------------------------------------------
+
+SOURCE_FEED_SPECS: dict[str, list[FeedSpec]] = {
+    "彭博社": [
+        FeedSpec("https://feeds.bloomberg.com/markets/news.rss", min_score=2.0),
+        FeedSpec("https://news.google.com/rss/search?q=site:bloomberg.com+(China+OR+Yuan+OR+CSI300+OR+PBOC+OR+Economy)&hl=en-US&gl=US&ceid=US:en", min_score=2.0),
+    ],
+    "路透社": [
+        FeedSpec("https://news.google.com/rss/search?q=site:reuters.com+(China+OR+economy+OR+markets+OR+yuan+OR+PBOC)&hl=en-US&gl=US&ceid=US:en", min_score=2.0),
+        FeedSpec("https://news.google.com/rss/search?q=site:reuters.com+(Fed+OR+inflation+OR+Treasury+OR+markets+OR+tariff)&hl=en-US&gl=US&ceid=US:en", min_score=2.0),
+    ],
+    "华尔街日报": [
+        FeedSpec("https://feeds.a.dj.com/rss/RSSMarketsMain.xml", min_score=2.0),
+        FeedSpec("https://news.google.com/rss/search?q=site:wsj.com+(China+OR+Trade+OR+Yuan+OR+PBOC+OR+Economy)&hl=en-US&gl=US&ceid=US:en", min_score=2.0),
+    ],
+    "金融时报": [
+        FeedSpec("https://www.ftchinese.com/rss/feed", min_score=2.0),
+        FeedSpec("https://www.ft.com/rss/markets", min_score=2.0),
+        FeedSpec("https://news.google.com/rss/search?q=site:ftchinese.com+OR+site:ft.com+(China+OR+Yuan+OR+Economy+OR+PBOC)&hl=zh-CN&gl=CN&ceid=CN:zh-Hans", min_score=2.0),
+    ],
+    "联合早报": [
+        FeedSpec("https://news.google.com/rss/search?q=site:zaobao.com.sg+(%E4%B8%AD%E5%9B%BD+OR+%E8%B4%A2%E7%BB%8F)&hl=zh-CN&gl=SG&ceid=SG:zh-Hans", min_score=2.0),
+    ],
+
+    "日经中文网": [
+        FeedSpec("https://news.google.com/rss/search?q=site:cn.nikkei.com+(%E4%B8%AD%E5%9B%BD+OR+%E7%BB%8F%E6%B5%8E+OR+%E5%8D%8A%E5%AF%BC%E4%BD%93+OR+%E6%97%A5%E5%85%83+OR+%E5%B8%82%E5%9C%BA+OR+%E4%BA%A7%E4%B8%9A)&hl=zh-CN&gl=CN&ceid=CN:zh-Hans", min_score=1.5, category="财经/中国·深度专栏"),
+        FeedSpec("https://news.google.com/rss/search?q=site:cn.nikkei.com&hl=zh-CN&gl=CN&ceid=CN:zh-Hans", min_score=1.5, category="财经/中国·深度专栏"),
+    ],
+    "经济学人": [
+        FeedSpec("https://www.economist.com/finance-and-economics/rss.xml", min_score=2.0, category="财经/中国·深度专栏"),
+        FeedSpec("https://www.economist.com/china/rss.xml", min_score=2.0, category="财经/中国·深度专栏"),
+        FeedSpec("https://news.google.com/rss/search?q=site:economist.com+(China+OR+economy+OR+markets+OR+finance+OR+Fed)&hl=en-US&gl=US&ceid=US:en", min_score=2.0, category="财经/中国·深度专栏"),
+    ],
+}
+
+
+def _fetch_source_declarative(
+    source_name: str,
+    lookback_hours: int,
+    max_per_source: int,
+    custom_collector: Callable[[int, int], list[NewsArticle]] | None = None
+) -> list[NewsArticle]:
+    """Fetch articles for a source using configured FeedSpecs and optional custom collectors."""
+    items: list[NewsArticle] = []
+
+    # Optional custom scraper (e.g. Lianhe Zaobao direct web scrape)
+    if custom_collector:
+        try:
+            items.extend(custom_collector(lookback_hours, max_per_source))
+        except Exception as e:
+            log.warning("[%s] 自定义抓取异常: %s", source_name, e)
+
+    # Standard RSS / GNews feeds
+    specs = SOURCE_FEED_SPECS.get(source_name, [])
+    for spec in specs:
+        try:
+            fetched = fetch_rss_feed(
+                source_name=source_name,
+                url=spec.url,
+                lookback_hours=lookback_hours,
+                max_items=spec.max_items,
+                force_relevant=True,
+                min_score=spec.min_score
+            )
+            for item in fetched:
+                item.category = spec.category
+            items.extend(fetched)
+        except Exception as e:
+            log.warning("[%s] Feed 抓取异常 (%s): %s", source_name, spec.url, e)
+
+    # Deduplicate and sort by relevance score
+    candidates = deduplicate_articles(items)
+    candidates.sort(key=lambda a: (a.relevance_score, a.published_at), reverse=True)
+    return candidates[:max_per_source]
 
 
 def collect_all_sources(lookback_hours: int = 24, max_per_source: int = 6) -> tuple[dict[str, list[NewsArticle]], list[str]]:
     """
-    Collect news from all 7 media outlets:
-    - 彭博社 (Bloomberg)
-    - 路透社 (Reuters)
-    - 华尔街日报 (Wall Street Journal / WSJ)
-    - 金融时报 (Financial Times / FT)
-    - 联合早报 (Lianhe Zaobao)
-    - 日经中文网 (Nikkei Chinese / Nikkei Asia)
-    - 经济学人 (The Economist)
+    Collect news from all 7 media outlets in parallel using ThreadPoolExecutor.
 
     Returns:
         (results_by_source, error_messages)
@@ -481,202 +623,16 @@ def collect_all_sources(lookback_hours: int = 24, max_per_source: int = 6) -> tu
     }
     errors: list[str] = []
 
-def _fetch_bloomberg(lookback_hours: int, max_per_source: int) -> list[NewsArticle]:
-    items = []
-    try:
-        items.extend(fetch_rss_feed("彭博社", "https://feeds.bloomberg.com/markets/news.rss", lookback_hours, max_items=20, min_score=2.0))
-    except Exception as e:
-        log.warning("Bloomberg official RSS error: %s", e)
-    try:
-        items.extend(fetch_rss_feed(
-            "彭博社",
-            "https://news.google.com/rss/search?q=site:bloomberg.com+(China+OR+Yuan+OR+CSI300+OR+PBOC+OR+Economy)&hl=en-US&gl=US&ceid=US:en",
-            lookback_hours, max_items=20, min_score=2.0
-        ))
-    except Exception as e:
-        log.warning("Bloomberg China GNews RSS error: %s", e)
-    candidates = deduplicate_articles(items)
-    if not candidates:
-        candidates = [item for item in deduplicate_articles(items) if item.relevance_score >= 0.5]
-    candidates.sort(key=lambda a: a.relevance_score, reverse=True)
-    return candidates[:max_per_source]
-
-
-def _fetch_reuters(lookback_hours: int, max_per_source: int) -> list[NewsArticle]:
-    items = []
-    try:
-        items.extend(fetch_rss_feed(
-            "路透社",
-            "https://news.google.com/rss/search?q=site:reuters.com+(China+OR+economy+OR+markets+OR+yuan+OR+PBOC)&hl=en-US&gl=US&ceid=US:en",
-            lookback_hours, max_items=20, min_score=2.0
-        ))
-    except Exception as e:
-        log.warning("Reuters China RSS error: %s", e)
-    try:
-        items.extend(fetch_rss_feed(
-            "路透社",
-            "https://news.google.com/rss/search?q=site:reuters.com+(Fed+OR+inflation+OR+Treasury+OR+markets+OR+tariff)&hl=en-US&gl=US&ceid=US:en",
-            lookback_hours, max_items=20, min_score=2.0
-        ))
-    except Exception as e:
-        log.warning("Reuters Business RSS error: %s", e)
-    candidates = deduplicate_articles(items)
-    if not candidates:
-        candidates = [item for item in deduplicate_articles(items) if item.relevance_score >= 0.5]
-    candidates.sort(key=lambda a: a.relevance_score, reverse=True)
-    return candidates[:max_per_source]
-
-
-def _fetch_wsj(lookback_hours: int, max_per_source: int) -> list[NewsArticle]:
-    items = []
-    try:
-        items.extend(fetch_rss_feed("华尔街日报", "https://feeds.a.dj.com/rss/RSSMarketsMain.xml", lookback_hours, max_items=20, min_score=2.0))
-    except Exception as e:
-        log.warning("WSJ Markets RSS error: %s", e)
-    try:
-        items.extend(fetch_rss_feed(
-            "华尔街日报",
-            "https://news.google.com/rss/search?q=site:wsj.com+(China+OR+Trade+OR+Yuan+OR+PBOC+OR+Economy)&hl=en-US&gl=US&ceid=US:en",
-            lookback_hours, max_items=20, min_score=2.0
-        ))
-    except Exception as e:
-        log.warning("WSJ China GNews error: %s", e)
-    candidates = deduplicate_articles(items)
-    if not candidates:
-        candidates = [item for item in deduplicate_articles(items) if item.relevance_score >= 0.5]
-    candidates.sort(key=lambda a: a.relevance_score, reverse=True)
-    return candidates[:max_per_source]
-
-
-def _fetch_ft(lookback_hours: int, max_per_source: int) -> list[NewsArticle]:
-    items = []
-    try:
-        items.extend(fetch_rss_feed("金融时报", "https://www.ftchinese.com/rss/feed", lookback_hours, max_items=20, min_score=2.0))
-    except Exception as e:
-        log.warning("FT Chinese RSS error: %s", e)
-    try:
-        items.extend(fetch_rss_feed("金融时报", "https://www.ft.com/rss/markets", lookback_hours, max_items=20, min_score=2.0))
-    except Exception as e:
-        log.warning("FT Markets RSS error: %s", e)
-    try:
-        items.extend(fetch_rss_feed(
-            "金融时报",
-            "https://news.google.com/rss/search?q=site:ftchinese.com+OR+site:ft.com+(China+OR+Yuan+OR+Economy+OR+PBOC)&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
-            lookback_hours, max_items=20, min_score=2.0
-        ))
-    except Exception as e:
-        log.warning("FT China GNews error: %s", e)
-    candidates = deduplicate_articles(items)
-    if not candidates:
-        candidates = [item for item in deduplicate_articles(items) if item.relevance_score >= 0.5]
-    candidates.sort(key=lambda a: a.relevance_score, reverse=True)
-    return candidates[:max_per_source]
-
-
-def _fetch_zaobao(lookback_hours: int, max_per_source: int) -> list[NewsArticle]:
-    items = []
-    try:
-        items.extend(fetch_zaobao_direct(lookback_hours, max_items=20))
-    except Exception as e:
-        log.warning("Zaobao direct scrape error: %s", e)
-    try:
-        items.extend(fetch_rss_feed(
-            "联合早报",
-            "https://news.google.com/rss/search?q=site:zaobao.com.sg/news/china+OR+site:zaobao.com.sg/finance+(%E4%B8%AD%E5%9B%BD+OR+%E8%B4%A2%E7%BB%8F)&hl=zh-CN&gl=SG&ceid=SG:zh-Hans",
-            lookback_hours, max_items=20, min_score=2.0
-        ))
-    except Exception as e:
-        log.warning("Zaobao GNews RSS error: %s", e)
-    candidates = deduplicate_articles(items)
-    if not candidates:
-        candidates = [item for item in deduplicate_articles(items) if item.relevance_score >= 0.5]
-    candidates.sort(key=lambda a: a.relevance_score, reverse=True)
-    return candidates[:max_per_source]
-
-
-def _fetch_nikkei(lookback_hours: int, max_per_source: int) -> list[NewsArticle]:
-    items = []
-    lookback = lookback_hours
-    try:
-        items.extend(fetch_rss_feed(
-            "日经中文网",
-            "https://news.google.com/rss/search?q=site:cn.nikkei.com+(%E4%B8%AD%E5%9B%BD+OR+%E7%BB%8F%E6%B5%8E+OR+%E5%8D%8A%E5%AF%BC%E4%BD%93+OR+%E6%97%A5%E5%85%83+OR+%E5%B8%82%E5%9C%BA+OR+%E4%BA%A7%E4%B8%9A)&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
-            lookback, max_items=20, min_score=1.5
-        ))
-    except Exception as e:
-        log.warning("Nikkei targeted GNews RSS error: %s", e)
-    if len(items) < max_per_source:
-        try:
-            items.extend(fetch_rss_feed(
-                "日经中文网",
-                "https://news.google.com/rss/search?q=site:cn.nikkei.com&hl=zh-CN&gl=CN&ceid=CN:zh-Hans",
-                lookback, max_items=20, min_score=1.5
-            ))
-        except Exception as e:
-            log.warning("Nikkei general GNews RSS error: %s", e)
-    for a in items:
-        a.category = "财经/中国·深度专栏"
-    candidates = deduplicate_articles(items)
-    if not candidates:
-        candidates = [item for item in deduplicate_articles(items) if item.relevance_score >= 0.5]
-    candidates.sort(key=lambda a: a.relevance_score, reverse=True)
-    return candidates[:max_per_source]
-
-
-def _fetch_economist(lookback_hours: int, max_per_source: int) -> list[NewsArticle]:
-    items = []
-    lookback = lookback_hours
-    try:
-        items.extend(fetch_rss_feed("经济学人", "https://www.economist.com/finance-and-economics/rss.xml", lookback, max_items=20, min_score=2.0))
-    except Exception as e:
-        log.warning("The Economist Finance RSS error: %s", e)
-    try:
-        items.extend(fetch_rss_feed("经济学人", "https://www.economist.com/china/rss.xml", lookback, max_items=20, min_score=2.0))
-    except Exception as e:
-        log.warning("The Economist China RSS error: %s", e)
-    try:
-        items.extend(fetch_rss_feed(
-            "经济学人",
-            "https://news.google.com/rss/search?q=site:economist.com+(China+OR+economy+OR+markets+OR+finance+OR+Fed)&hl=en-US&gl=US&ceid=US:en",
-            lookback, max_items=20, min_score=2.0
-        ))
-    except Exception as e:
-        log.warning("The Economist GNews RSS error: %s", e)
-    for a in items:
-        a.category = "财经/中国·深度专栏"
-    candidates = deduplicate_articles(items)
-    if not candidates:
-        candidates = [item for item in deduplicate_articles(items) if item.relevance_score >= 0.5]
-    candidates.sort(key=lambda a: a.relevance_score, reverse=True)
-    return candidates[:max_per_source]
-
-
-def collect_all_sources(lookback_hours: int = 24, max_per_source: int = 6) -> tuple[dict[str, list[NewsArticle]], list[str]]:
-    """
-    Collect news from all 7 media outlets in parallel using ThreadPoolExecutor.
-    """
-    results: dict[str, list[NewsArticle]] = {
-        "彭博社": [],
-        "路透社": [],
-        "华尔街日报": [],
-        "金融时报": [],
-        "联合早报": [],
-        "日经中文网": [],
-        "经济学人": [],
-    }
-    errors: list[str] = []
-
     collectors = {
-        "彭博社": lambda: _fetch_bloomberg(lookback_hours, max_per_source),
-        "路透社": lambda: _fetch_reuters(lookback_hours, max_per_source),
-        "华尔街日报": lambda: _fetch_wsj(lookback_hours, max_per_source),
-        "金融时报": lambda: _fetch_ft(lookback_hours, max_per_source),
-        "联合早报": lambda: _fetch_zaobao(lookback_hours, max_per_source),
-        "日经中文网": lambda: _fetch_nikkei(lookback_hours, max_per_source),
-        "经济学人": lambda: _fetch_economist(lookback_hours, max_per_source),
+        "彭博社": lambda: _fetch_source_declarative("彭博社", lookback_hours, max_per_source),
+        "路透社": lambda: _fetch_source_declarative("路透社", lookback_hours, max_per_source),
+        "华尔街日报": lambda: _fetch_source_declarative("华尔街日报", lookback_hours, max_per_source),
+        "金融时报": lambda: _fetch_source_declarative("金融时报", lookback_hours, max_per_source),
+        "联合早报": lambda: _fetch_source_declarative("联合早报", lookback_hours, max_per_source, custom_collector=fetch_zaobao_direct),
+        "日经中文网": lambda: _fetch_source_declarative("日经中文网", lookback_hours, max_per_source),
+        "经济学人": lambda: _fetch_source_declarative("经济学人", lookback_hours, max_per_source),
     }
 
-    # Parallel collection
     with ThreadPoolExecutor(max_workers=len(collectors)) as executor:
         future_to_src = {executor.submit(func): src for src, func in collectors.items()}
         for future in as_completed(future_to_src):
@@ -684,9 +640,7 @@ def collect_all_sources(lookback_hours: int = 24, max_per_source: int = 6) -> tu
             try:
                 raw_items = future.result()
                 if raw_items:
-                    deduped = deduplicate_articles(raw_items)
-                    deduped.sort(key=lambda a: a.relevance_score, reverse=True)
-                    results[src] = deduped[:max_per_source]
+                    results[src] = raw_items
                 else:
                     errors.append(f"{src}：未能成功拉取更新")
             except Exception as e:
@@ -694,4 +648,3 @@ def collect_all_sources(lookback_hours: int = 24, max_per_source: int = 6) -> tu
                 errors.append(f"{src}：抓取异常 ({type(e).__name__})")
 
     return results, errors
-

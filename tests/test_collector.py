@@ -166,3 +166,31 @@ def test_relevance_ranking_orders_articles_correctly():
     assert len(valid_articles) == 2
     assert valid_articles[0].title == "US Lead in AI Over China Narrows After DeepSeek Gains"
     assert valid_articles[1].title == "Stocks Rise as Oil Drop Offsets Europe Debt Worry"
+
+
+def test_source_feed_specs_coverage():
+    from collector import SOURCE_FEED_SPECS
+    expected_sources = ["彭博社", "路透社", "华尔街日报", "金融时报", "联合早报", "日经中文网", "经济学人"]
+    for src in expected_sources:
+        assert src in SOURCE_FEED_SPECS, f"Source {src} must be configured in SOURCE_FEED_SPECS"
+        assert len(SOURCE_FEED_SPECS[src]) >= 1, f"Source {src} must have at least 1 feed spec"
+
+
+def test_deduplicate_articles_fuzzy_and_antonym():
+    from collector import deduplicate_articles
+    now = datetime.now(timezone.utc)
+
+    # 1. Near duplicate should be deduplicated
+    a1 = NewsArticle("彭博社", "中国央行今日开展5000亿元买断式逆回购操作", "https://example.com/1", "", now, relevance_score=10.0)
+    a2 = NewsArticle("路透社", "中国央行开展5000亿元买断式逆回购操作", "https://example.com/2", "", now, relevance_score=8.0)
+    deduped = deduplicate_articles([a1, a2], similarity_threshold=0.85)
+    assert len(deduped) == 1
+    assert deduped[0].url == "https://example.com/1"
+
+    # 2. Antonym polarity titles should NOT be deduplicated even with high similarity
+    a3 = NewsArticle("彭博社", "中国8月工业增加值同比上涨5.3% 超出预期", "https://example.com/3", "", now, relevance_score=10.0)
+    a4 = NewsArticle("路透社", "中国8月工业增加值同比下跌5.3% 超出预期", "https://example.com/4", "", now, relevance_score=9.0)
+    deduped_opp = deduplicate_articles([a3, a4], similarity_threshold=0.85)
+    assert len(deduped_opp) == 2
+
+

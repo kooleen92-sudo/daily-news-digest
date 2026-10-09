@@ -261,8 +261,9 @@ def send_digest_email(body_markdown: str, errors: list[str], image_path: Path | 
     message = EmailMessage()
     message["Subject"] = subject
     message["From"] = config.mail_from or config.smtp_user
-    message["To"] = config.mail_to
+    message["To"] = ", ".join(config.recipient_list) if config.recipient_list else config.mail_to
     message["Date"] = format_datetime(now)
+
 
     # Plain text fallback
     plain_summary = (
@@ -326,8 +327,9 @@ def send_digest_email(body_markdown: str, errors: list[str], image_path: Path | 
             fallback_msg = EmailMessage()
             fallback_msg["Subject"] = subject
             fallback_msg["From"] = config.mail_from or config.smtp_user
-            fallback_msg["To"] = config.mail_to
+            fallback_msg["To"] = ", ".join(config.recipient_list) if config.recipient_list else config.mail_to
             fallback_msg["Date"] = format_datetime(now)
+
 
             clean_md = (
                 f"## 📋 每日财经与中国宏观深度简报 ({date_str})\n\n"
