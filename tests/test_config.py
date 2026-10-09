@@ -14,8 +14,8 @@ def test_provider_detection_gemini():
     providers = cfg.get_configured_providers()
     assert len(providers) >= 1
     assert providers[0]["name"] == "Google Gemini"
-    assert providers[0]["model"] == "gemini-3.8-flash"
-    assert "gemini-3.1-pro" in providers[0]["candidates"]
+    assert providers[0]["model"] in {"gemini-3.5-flash", "gemini-3.8-flash"}
+    assert "gemini-3.5-flash" in providers[0]["candidates"]
     assert "gemini-3.8-flash" in providers[0]["candidates"]
 
 

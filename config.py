@@ -42,7 +42,7 @@ class AppConfig:
     # Dedicated Gemini Settings (Priority 1)
     gemini_api_key: str = ""
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
-    gemini_model: str = "gemini-3.8-flash"
+    gemini_model: str = "gemini-3.5-flash"
 
     # Dedicated DeepSeek Settings (Priority 2 / Fallback)
     deepseek_api_key: str = ""
@@ -74,7 +74,7 @@ class AppConfig:
         # Tier 1: Gemini
         if self.gemini_api_key:
             gemini_candidates = []
-            for m in [self.gemini_model, "gemini-3.8-flash", "gemini-3.1-pro", "gemini-3.5-flash", "gemini-3.5-flash-lite"]:
+            for m in [self.gemini_model, "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash"]:
                 if m and m not in gemini_candidates:
                     gemini_candidates.append(m)
             providers.append({
@@ -210,7 +210,7 @@ class AppConfig:
             openai_base if "googleapis.com" in openai_base_lower else "https://generativelanguage.googleapis.com/v1beta/openai/"
         )
         gemini_model = os.getenv("GEMINI_MODEL", "").strip() or (
-            openai_model if "gemini" in openai_model.lower() else "gemini-3.8-flash"
+            openai_model if "gemini" in openai_model.lower() else "gemini-3.5-flash"
         )
 
         # Dedicated DeepSeek configuration
