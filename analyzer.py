@@ -252,9 +252,12 @@ def _call_llm_provider(
     if base_url and "googleapis.com" in base_url and not base_url.endswith("/openai/"):
         base_url = base_url.rstrip("/") + "/openai/"
 
+    # For Gemini, cap single-call timeout to 60s to avoid hanging CI runners
+    call_timeout = 60.0 if (base_url and "googleapis.com" in base_url) else config.llm_timeout
+
     client_kwargs: dict[str, Any] = {
         "api_key": api_key.strip(),
-        "timeout": config.llm_timeout,
+        "timeout": call_timeout,
         "max_retries": 1,
     }
     if base_url:
@@ -315,18 +318,26 @@ def _call_llm_provider(
                 return None, exc
 
             except openai.NotFoundError as exc:
-                log.warning("[%s] 模型 '%s' 不存在或已被下线: %s", provider_name, model_name, exc)
+                log.warning("[%s] 模型 '%s' 不存在或已被下线 (404): %s", provider_name, model_name, exc)
                 last_error = exc
-                break  # switch immediately to next candidate model
+                break  # 立即切换到候选池中的下一个模型
+
+            except openai.APITimeoutError as exc:
+                last_error = exc
+                log.warning("[%s] 模型 '%s' 调用超时 (已耗时 %.0fs)，快速切换至下一候选模型...", provider_name, model_name, call_timeout)
+                break  # 超时表明当前模型节点或网络卡死，不再重复等待，直接切换模型
 
             except (openai.RateLimitError, openai.APIConnectionError, openai.InternalServerError) as exc:
                 last_error = exc
-                log.warning("[%s] 临时服务异常 (%s): %s", provider_name, type(exc).__name__, exc)
-                if attempt < 2:
-                    wait_sec = 4 * (attempt + 1)
-                    log.info("[%s] 暂停 %d 秒后进行重试...", provider_name, wait_sec)
+                log.warning("[%s] 模型 '%s' 临时服务异常 (%s): %s", provider_name, model_name, type(exc).__name__, exc)
+                if attempt == 0:
+                    wait_sec = 2
+                    log.info("[%s] 节点繁忙 (503/429)，暂停 %d 秒后重试...", provider_name, wait_sec)
                     time.sleep(wait_sec)
                     continue
+                else:
+                    log.info("[%s] 模型 '%s' 持续繁忙，立即切换候选池下一模型...", provider_name, model_name)
+                    break
 
             except Exception as exc:
                 last_error = exc

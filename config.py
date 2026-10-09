@@ -74,7 +74,7 @@ class AppConfig:
         # Tier 1: Gemini
         if self.gemini_api_key:
             gemini_candidates = []
-            for m in [self.gemini_model, "gemini-3.8-flash", "gemini-3.1-pro", "gemini-3.5-flash", "gemini-2.5-flash", "gemini-2.0-flash"]:
+            for m in [self.gemini_model, "gemini-3.8-flash", "gemini-3.1-pro", "gemini-3.5-flash", "gemini-3.5-flash-lite"]:
                 if m and m not in gemini_candidates:
                     gemini_candidates.append(m)
             providers.append({
