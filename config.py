@@ -38,6 +38,8 @@ class AppConfig:
     openai_base_url: str = ""
     llm_model: str = "gpt-4o-mini"
     llm_timeout: float = 90.0
+    llm_max_tokens: int = 8192
+    llm_max_tokens_large: int = 16384
 
     # Dedicated Gemini Settings (Priority 1)
     gemini_api_key: str = ""
@@ -242,6 +244,8 @@ class AppConfig:
             openai_base_url=openai_base,
             llm_model=openai_model or "gpt-4o-mini",
             llm_timeout=get_float("LLM_TIMEOUT", 90.0),
+            llm_max_tokens=get_int("LLM_MAX_TOKENS", 8192),
+            llm_max_tokens_large=get_int("LLM_MAX_TOKENS_LARGE", 16384),
             gemini_api_key=gemini_key,
             gemini_base_url=gemini_base,
             gemini_model=gemini_model,

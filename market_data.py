@@ -10,7 +10,9 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 import requests
 
 log = logging.getLogger("daily-news")
@@ -97,7 +99,7 @@ def fetch_market_snapshot(timeout: float = 6.0) -> list[MarketQuote]:
                     log.debug("解析行情字段异常 [%s]: %s", var_name, err)
 
     except Exception as exc:
-        log.warning("获取实时行情快照失败（不影响主流程）: %s", exc)
+        log.warning("获取行情快照失败（不影响主流程）: %s", exc)
 
     # Fetch USD/CNH forex quote as complementary macro signal
     try:
@@ -126,6 +128,37 @@ def fetch_market_snapshot(timeout: float = 6.0) -> list[MarketQuote]:
         log.debug("获取离岸人民币汇率跳过: %s", exc)
 
     return quotes
+
+
+def _market_snapshot_note(now: datetime | None = None) -> str:
+    """Describe snapshot fetch time and A-share/HK session state.
+
+    The digest runs around 08:00 Beijing time, before A-share/HK markets open, so their
+    quotes reflect the previous trading day's close rather than live prices.
+    """
+    current = now or datetime.now(ZoneInfo("Asia/Shanghai"))
+    stamp = current.strftime("%Y-%m-%d %H:%M")
+    minutes = current.hour * 60 + current.minute
+    is_weekday = current.weekday() < 5
+
+    # A股 09:30-11:30 / 13:00-15:00；港股 09:30-12:00 / 13:00-16:00（北京时间）
+    a_share_open = is_weekday and ((570 <= minutes < 690) or (780 <= minutes < 900))
+    hk_open = is_weekday and ((570 <= minutes < 720) or (780 <= minutes < 960))
+
+    if a_share_open and hk_open:
+        session = "A股与港股当前处于交易时段，相关点位为盘中实时行情"
+    elif a_share_open:
+        session = "A股当前处于交易时段（盘中实时），港股为最近成交价"
+    elif hk_open:
+        session = "港股当前处于交易时段（盘中实时），A股为最近成交价"
+    elif is_weekday and minutes < 570:
+        session = "A股与港股尚未开盘（09:30 开盘），相关点位为上一交易日收盘价"
+    elif is_weekday and minutes >= 900:
+        session = "A股与港股已收盘，相关点位为当日收盘价"
+    else:
+        session = "A股与港股处于非交易日/休市状态，相关点位为最近一个交易日收盘价"
+
+    return f"*行情快照抓取时间：{stamp}（北京时间）。{session}；美股、黄金与汇率报价为其最近可得的收盘/最新价。*"
 
 
 def render_market_table(quotes: list[MarketQuote]) -> str:
@@ -161,16 +194,19 @@ def render_market_table(quotes: list[MarketQuote]) -> str:
         lines.append(f"| **{q.name}** | `{price_str}` | {pct_str} {badge} | {q.category} |")
 
     lines.append("")
+    lines.append(_market_snapshot_note())
     return "\n".join(lines)
 
 
 def format_market_context_for_prompt(quotes: list[MarketQuote]) -> str:
     """Format market snapshot into a prompt block for the LLM."""
     if not quotes:
-        return "（未获取到当日实时行情数据）"
+        return "（未获取到行情数据）"
 
     items = []
     for q in quotes:
         sign = "+" if q.change_pct > 0 else ""
         items.append(f"- {q.name} ({q.category}): 最新价 {q.price}, 涨跌幅 {sign}{q.change_pct:.2f}%")
+    items.append("")
+    items.append(_market_snapshot_note())
     return "\n".join(items)

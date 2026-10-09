@@ -278,7 +278,7 @@ def execute_digest(*, dry_run: bool = False) -> None:
             log.info("正在获取全球大类资产与宏观行情快照（A股基准、恒指、美股大盘、黄金ETF、离岸人民币）...")
             market_quotes = fetch_market_snapshot(timeout=config.fetch_timeout)
             if market_quotes:
-                log.info("成功获取 %d 项实时资产与宏观行情指标", len(market_quotes))
+                log.info("成功获取 %d 项资产与宏观行情指标", len(market_quotes))
                 status_record["market_quotes_count"] = len(market_quotes)
 
             # 2. 抓取七大权威外媒（并发并行抓取）
@@ -306,7 +306,7 @@ def execute_digest(*, dry_run: bool = False) -> None:
             if errors:
                 log.warning("抓取遇到以下告警: %s", "；".join(errors))
 
-            # 5. 深度分析与影响剖析（结合实时行情与资产配置指引）
+            # 5. 深度分析与影响剖析（结合行情快照与资产配置指引）
             log.info("正在生成财经与中国宏观深度分析报告...")
             report_markdown = analyze_news(articles_by_source, errors, market_quotes=market_quotes)
             is_valid, integrity_issues = validate_report_integrity(report_markdown)
@@ -342,17 +342,18 @@ def execute_digest(*, dry_run: bool = False) -> None:
             log.info("已生成本地文件：\n  - Markdown: %s\n  - HTML: %s\n  - Long Image: %s",
                      md_file, html_file, long_image_path or "(未生成)")
 
-            # 7. 永久归档、门户索引更新与 RSS 2.0 订阅源生成
-            archive_daily_digest(report_markdown, html_content, date_tag, image_path=long_image_path)
-            generate_archive_portal()
-            generate_rss_feed()
+            # 7. 永久归档、门户索引更新与 RSS 2.0 订阅源生成（仅正式运行写入，Dry Run 不污染历史归档）
+            if not dry_run:
+                archive_daily_digest(report_markdown, html_content, date_tag, image_path=long_image_path)
 
-            # 自动维护：清理过期旧输出
-            clean_old_outputs(config.output_retention_days)
+                # 自动维护：先清理过期旧输出，再生成门户索引与 RSS，避免索引引用刚被删除的历史文件
+                clean_old_outputs(config.output_retention_days)
+                generate_archive_portal()
+                generate_rss_feed()
 
             # 8. 邮件发送与多渠道 Webhook 协同通知（先完成归档与输出，再做投递）
             if dry_run:
-                log.info("[Dry Run 模式] 本次执行仅生成预览、长图与历史归档，不发送邮件与通知，也不记录已推送文章库。")
+                log.info("[Dry Run 模式] 本次执行仅生成预览与长图，不写入历史归档，不发送邮件与通知，也不记录已推送文章库。")
                 status_record["overall_status"] = "SUCCESS_DRY_RUN"
                 return
 

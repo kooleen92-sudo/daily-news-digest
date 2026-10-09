@@ -103,3 +103,17 @@ def test_resolve_google_news_config(monkeypatch):
     monkeypatch.setenv("RESOLVE_GOOGLE_NEWS", "false")
     assert AppConfig.load().resolve_google_news is False
 
+
+def test_llm_max_tokens_config(monkeypatch):
+    monkeypatch.delenv("LLM_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("LLM_MAX_TOKENS_LARGE", raising=False)
+    default_cfg = AppConfig.load()
+    assert default_cfg.llm_max_tokens == 8192
+    assert default_cfg.llm_max_tokens_large == 16384
+
+    monkeypatch.setenv("LLM_MAX_TOKENS", "4096")
+    monkeypatch.setenv("LLM_MAX_TOKENS_LARGE", "12288")
+    custom_cfg = AppConfig.load()
+    assert custom_cfg.llm_max_tokens == 4096
+    assert custom_cfg.llm_max_tokens_large == 12288
+

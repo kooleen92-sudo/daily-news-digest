@@ -83,3 +83,78 @@ def test_send_telegram_notice_respects_text_limit(mock_post):
     payload = mock_post.call_args.kwargs["json"]
     assert len(payload["text"]) <= 4096
     assert not payload["text"].endswith("&")
+
+
+def test_dispatch_webhooks_dispatches_all_channels(monkeypatch):
+    import notifier
+
+    calls = []
+
+    def make_sender(name):
+        def sender(*args):
+            calls.append(name)
+            return True
+        return sender
+
+    monkeypatch.setenv("WECOM_WEBHOOK_URL", "https://example.com/wecom")
+    monkeypatch.setenv("FEISHU_WEBHOOK_URL", "https://example.com/feishu")
+    monkeypatch.setenv("DINGTALK_WEBHOOK_URL", "https://example.com/dingtalk")
+    monkeypatch.setenv("SERVERCHAN_KEY", "sct-test-key")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bot-token")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "chat-id")
+
+    for channel, attr in (
+        ("wecom", "send_wecom_webhook"),
+        ("feishu", "send_feishu_webhook"),
+        ("dingtalk", "send_dingtalk_webhook"),
+        ("serverchan", "send_serverchan_notice"),
+        ("telegram", "send_telegram_notice"),
+    ):
+        monkeypatch.setattr(notifier, attr, make_sender(channel))
+
+    results = dispatch_webhooks("Title", "Content")
+
+    assert results == {
+        "wecom": True,
+        "feishu": True,
+        "dingtalk": True,
+        "serverchan": True,
+        "telegram": True,
+    }
+    assert sorted(calls) == sorted(results)
+
+
+def test_dispatch_webhooks_runs_channels_concurrently(monkeypatch):
+    import threading
+    import notifier
+
+    barrier = threading.Barrier(2, timeout=5)
+
+    def wait_for_peer(*args):
+        barrier.wait()
+        return True
+
+    monkeypatch.setenv("WECOM_WEBHOOK_URL", "https://example.com/wecom")
+    monkeypatch.setenv("FEISHU_WEBHOOK_URL", "https://example.com/feishu")
+    monkeypatch.setattr(notifier, "send_wecom_webhook", wait_for_peer)
+    monkeypatch.setattr(notifier, "send_feishu_webhook", wait_for_peer)
+
+    results = dispatch_webhooks("Title", "Content")
+
+    assert results == {"wecom": True, "feishu": True}
+
+
+def test_dispatch_webhooks_isolates_channel_failure(monkeypatch):
+    import notifier
+
+    def failing_sender(*args):
+        raise RuntimeError("network down")
+
+    monkeypatch.setenv("WECOM_WEBHOOK_URL", "https://example.com/wecom")
+    monkeypatch.setenv("FEISHU_WEBHOOK_URL", "https://example.com/feishu")
+    monkeypatch.setattr(notifier, "send_wecom_webhook", failing_sender)
+    monkeypatch.setattr(notifier, "send_feishu_webhook", lambda *args: True)
+
+    results = dispatch_webhooks("Title", "Content")
+
+    assert results == {"wecom": False, "feishu": True}

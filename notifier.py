@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 import requests
@@ -158,34 +159,48 @@ def send_telegram_notice(bot_token: str, chat_id: str, title: str, markdown_text
 def dispatch_webhooks(title: str, markdown_text: str) -> dict[str, bool]:
     """
     Check environment variables for configured webhook endpoints and dispatch notifications.
-    Returns status mapping for each configured provider.
+    All configured channels run concurrently so total latency stays near the slowest single
+    channel instead of the sum of every channel. Returns status mapping for each configured
+    provider, preserving the channel order.
     """
-    results: dict[str, bool] = {}
+    tasks: list[tuple[str, Any, tuple[Any, ...]]] = []
 
     # 1. WeCom
     wecom_url = os.getenv("WECOM_WEBHOOK_URL", "").strip()
     if wecom_url:
-        results["wecom"] = send_wecom_webhook(wecom_url, title, markdown_text)
+        tasks.append(("wecom", send_wecom_webhook, (wecom_url, title, markdown_text)))
 
     # 2. Feishu
     feishu_url = os.getenv("FEISHU_WEBHOOK_URL", "").strip()
     if feishu_url:
-        results["feishu"] = send_feishu_webhook(feishu_url, title, markdown_text)
+        tasks.append(("feishu", send_feishu_webhook, (feishu_url, title, markdown_text)))
 
     # 3. DingTalk
     dingtalk_url = os.getenv("DINGTALK_WEBHOOK_URL", "").strip()
     if dingtalk_url:
-        results["dingtalk"] = send_dingtalk_webhook(dingtalk_url, title, markdown_text)
+        tasks.append(("dingtalk", send_dingtalk_webhook, (dingtalk_url, title, markdown_text)))
 
     # 4. ServerChan
     serverchan_key = os.getenv("SERVERCHAN_KEY", "").strip()
     if serverchan_key:
-        results["serverchan"] = send_serverchan_notice(serverchan_key, title, markdown_text)
+        tasks.append(("serverchan", send_serverchan_notice, (serverchan_key, title, markdown_text)))
 
     # 5. Telegram
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     tg_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if tg_token and tg_chat_id:
-        results["telegram"] = send_telegram_notice(tg_token, tg_chat_id, title, markdown_text)
+        tasks.append(("telegram", send_telegram_notice, (tg_token, tg_chat_id, title, markdown_text)))
 
+    if not tasks:
+        return {}
+
+    results: dict[str, bool] = {}
+    with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+        futures = {name: pool.submit(sender, *args) for name, sender, args in tasks}
+        for name, future in futures.items():
+            try:
+                results[name] = bool(future.result())
+            except Exception as exc:
+                log.warning("%s Webhook 推送线程异常: %s", name, exc)
+                results[name] = False
     return results

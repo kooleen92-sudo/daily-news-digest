@@ -8,9 +8,11 @@ import pytest
 import main
 
 
-def _patch_digest_dependencies(monkeypatch, tmp_path, *, send_email):
+def _patch_digest_dependencies(monkeypatch, tmp_path, *, send_email, maintenance=None):
     statuses = []
     pushed = []
+    if maintenance is None:
+        maintenance = []
     output_dir = tmp_path / "output"
     logs_dir = tmp_path / "logs"
     config = SimpleNamespace(
@@ -41,10 +43,10 @@ def _patch_digest_dependencies(monkeypatch, tmp_path, *, send_email):
         return str(image_file)
 
     monkeypatch.setattr(main, "generate_digest_image", generate_image)
-    monkeypatch.setattr(main, "archive_daily_digest", lambda *args, **kwargs: None)
-    monkeypatch.setattr(main, "generate_archive_portal", lambda: None)
-    monkeypatch.setattr(main, "generate_rss_feed", lambda: None)
-    monkeypatch.setattr(main, "clean_old_outputs", lambda retention_days: None)
+    monkeypatch.setattr(main, "archive_daily_digest", lambda *args, **kwargs: maintenance.append("archive"))
+    monkeypatch.setattr(main, "generate_archive_portal", lambda: maintenance.append("portal"))
+    monkeypatch.setattr(main, "generate_rss_feed", lambda: maintenance.append("rss"))
+    monkeypatch.setattr(main, "clean_old_outputs", lambda retention_days: maintenance.append("clean"))
     monkeypatch.setattr(main, "send_digest_email", send_email)
     monkeypatch.setattr(main, "dispatch_webhooks", lambda title, report: {})
     monkeypatch.setattr(main, "record_pushed_articles", lambda articles, is_dry_run: pushed.append(is_dry_run))
@@ -112,3 +114,36 @@ def test_invalid_report_with_articles_still_fails(tmp_path, monkeypatch):
 
     assert statuses[-1]["overall_status"] == "FAILED"
     assert pushed == []
+
+
+def test_dry_run_generates_preview_without_archive_or_delivery(tmp_path, monkeypatch):
+    sent = []
+    maintenance = []
+    statuses, pushed = _patch_digest_dependencies(
+        monkeypatch,
+        tmp_path,
+        send_email=lambda *args, **kwargs: sent.append("email"),
+        maintenance=maintenance,
+    )
+
+    main.execute_digest(dry_run=True)
+
+    assert statuses[-1]["overall_status"] == "SUCCESS_DRY_RUN"
+    assert maintenance == []
+    assert sent == []
+    assert pushed == []
+
+
+def test_regular_run_archives_cleans_then_rebuilds_portal_and_rss(tmp_path, monkeypatch):
+    maintenance = []
+    statuses, pushed = _patch_digest_dependencies(
+        monkeypatch,
+        tmp_path,
+        send_email=lambda *args, **kwargs: None,
+        maintenance=maintenance,
+    )
+
+    main.execute_digest(dry_run=False)
+
+    assert statuses[-1]["overall_status"] == "SUCCESS"
+    assert maintenance == ["archive", "clean", "portal", "rss"]

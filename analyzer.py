@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 import openai
 from openai import OpenAI
 from config import BASE_DIR, config
-from collector import NewsArticle
+from collector import NewsArticle, normalize_url
 from prompts import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE, REPORT_DISCLAIMER
 from market_data import MarketQuote, format_market_context_for_prompt, render_market_table
 
@@ -128,20 +128,23 @@ def validate_report_integrity(markdown_report: str) -> tuple[bool, list[str]]:
 
 
 def compute_articles_hash(articles_by_source: dict[str, list[NewsArticle]]) -> str:
-    """Calculate MD5 fingerprint of the scraped articles for idempotent caching."""
+    """Calculate MD5 fingerprint of the scraped articles for idempotent caching.
+
+    Uses normalized URL + title as the article identity so minor feed jitter
+    (tracking params, summary tweaks, second-level timestamp drift) does not
+    invalidate the same-day analysis cache.
+    """
     hasher = hashlib.md5()
-    hasher.update(b"cache-schema-v3")
+    hasher.update(b"cache-schema-v4")
     for src in sorted(articles_by_source.keys()):
         sorted_articles = sorted(
             articles_by_source[src],
-            key=lambda a: (a.url.strip(), a.title.strip(), (a.summary or "").strip(), a.published_at.isoformat()),
+            key=lambda a: (normalize_url(a.url), a.title.strip()),
         )
         for a in sorted_articles:
             hasher.update(a.source.strip().encode("utf-8"))
-            hasher.update(a.url.strip().encode("utf-8"))
+            hasher.update(normalize_url(a.url).encode("utf-8"))
             hasher.update(a.title.strip().encode("utf-8"))
-            hasher.update((a.summary or "").strip().encode("utf-8"))
-            hasher.update(a.published_at.isoformat().encode("utf-8"))
     return hasher.hexdigest()
 
 
@@ -349,7 +352,11 @@ def _call_llm_provider(
         for attempt in range(3):
             try:
                 log.info("[%s] 正在调用模型: %s (第 %d/3 次尝试)...", provider_name, model_name, attempt + 1)
-                max_tokens = 16384 if ("pro" in model_name or "reasoner" in model_name) else 8192
+                max_tokens = (
+                    config.llm_max_tokens_large
+                    if ("pro" in model_name or "reasoner" in model_name)
+                    else config.llm_max_tokens
+                )
                 create_kwargs = {
                     "model": model_name,
                     "temperature": 0.3,
@@ -473,7 +480,7 @@ def analyze_news(
         log.warning("本次未抓取到任何有效新闻，生成无新闻说明报告（仍将按正常流程投递）。")
         return generate_no_news_report(errors, market_quotes=market_quotes)
 
-    market_context = format_market_context_for_prompt(market_quotes) if market_quotes else "（未提供实时行情数据）"
+    market_context = format_market_context_for_prompt(market_quotes) if market_quotes else "（未提供行情数据）"
     market_table = render_market_table(market_quotes) if market_quotes else ""
 
     articles_text = format_articles_for_prompt(articles_by_source)
