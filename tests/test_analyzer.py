@@ -142,3 +142,148 @@ def test_cache_date_timezone_aware(tmp_path, monkeypatch):
     loaded = get_cached_analysis(test_hash)
     assert loaded == test_report
 
+
+def test_validate_report_integrity_accepts_heading_variants():
+    from analyzer import validate_report_integrity
+
+    template = """# 今日宏观简报
+
+## 一、今日宏观核心研判与前瞻（Executive Summary）
+全球宏观核心研判内容，美联储处于政策观望期。
+
+## 二、个人投资与大类资产配置实战指南（Personal Allocation Blueprint）
+个人配置实战指南内容，覆盖 A 股、基金、QDII 与黄金。
+
+| 资产类别 | 稳健型比例 | 进取型比例 |
+|---|---|---|
+| A股核心资产 | 30% | 45% |
+
+## 三、市场与资产影响速查矩阵（Market Impact Matrix）
+| 资产 | 影响倾向 | 逻辑 |
+|---|---|---|
+| A股 | 🟢利好 | 政策发力 |
+
+## 四、各家外媒精要与深度影响剖析（In-Depth Analysis）
+外媒深度分析内容。
+""" + ("详细分析文字 " * 150)
+
+    original_headings = (
+        "## 一、今日宏观核心研判与前瞻（Executive Summary）",
+        "## 二、个人投资与大类资产配置实战指南（Personal Allocation Blueprint）",
+        "## 三、市场与资产影响速查矩阵（Market Impact Matrix）",
+        "## 四、各家外媒精要与深度影响剖析（In-Depth Analysis）",
+    )
+    variants = [
+        ("### 一、今日宏观核心研判与前瞻", "### 二、个人投资与大类资产配置实战指南",
+         "### 三、市场与资产影响速查矩阵", "### 四、各家外媒精要与深度影响剖析"),
+        ("# 1. 今日宏观核心研判与前瞻", "# 2. 个人投资与大类资产配置实战指南",
+         "# 3. 市场与资产影响速查矩阵", "# 4. 各家外媒精要与深度影响剖析"),
+        ("**一、今日宏观核心研判与前瞻**", "**二、个人投资与大类资产配置实战指南**",
+         "**三、市场与资产影响速查矩阵**", "**四、各家外媒精要与深度影响剖析**"),
+    ]
+
+    for variant in variants:
+        report = template
+        for old, new in zip(original_headings, variant):
+            report = report.replace(old, new)
+        is_valid, issues = validate_report_integrity(report)
+        assert is_valid, f"标题变体应通过校验: {variant} -> {issues}"
+
+
+def test_no_news_report_is_deliverable():
+    from analyzer import analyze_news
+    from prompts import REPORT_DISCLAIMER
+
+    report = analyze_news({}, ["彭博社：未能成功拉取更新"])
+    assert "暂无" in report
+    assert "彭博社：未能成功拉取更新" in report
+    assert REPORT_DISCLAIMER.strip() in report
+
+
+def _build_valid_report():
+    return (
+        "# 今日简报\n\n"
+        "## 一、今日宏观核心研判与前瞻（Executive Summary）\n" + "宏观研判内容。" * 10 + "\n\n"
+        "## 二、个人投资与大类资产配置实战指南（Personal Allocation Blueprint）\n" + "配置指南内容。" * 10 + "\n\n"
+        "| 资产类别 | 稳健型 | 进取型 |\n|---|---|---|\n| A股 | 30% | 45% |\n\n"
+        "## 三、市场与资产影响速查矩阵（Market Impact Matrix）\n" + "矩阵内容。" * 10 + "\n\n"
+        "## 四、各家外媒精要与深度影响剖析（In-Depth Analysis）\n" + "外媒分析内容。" * 150
+    )
+
+
+def _make_fake_openai(monkeypatch, responses):
+    """Patch analyzer.OpenAI with a fake client returning queued (content, finish_reason) pairs."""
+    import analyzer
+    from types import SimpleNamespace
+
+    calls = []
+
+    class _FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            content, finish_reason = responses.pop(0)
+            choice = SimpleNamespace(message=SimpleNamespace(content=content), finish_reason=finish_reason)
+            return SimpleNamespace(choices=[choice])
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=_FakeCompletions())
+
+    monkeypatch.setattr(analyzer, "OpenAI", _FakeClient)
+    return calls
+
+
+def test_call_llm_provider_skips_blind_retry_on_invalid_format(monkeypatch):
+    import analyzer
+
+    valid_report = _build_valid_report()
+    responses = [
+        ("无结构内容。" * 20, "stop"),
+        (valid_report, "stop"),
+    ]
+    calls = _make_fake_openai(monkeypatch, responses)
+
+    content, err = analyzer._call_llm_provider(
+        provider_name="FakeProvider",
+        api_key="sk-test",
+        base_url="https://example.com/v1",
+        candidate_models=["m1", "m2"],
+        prompt="prompt",
+    )
+
+    assert err is None
+    assert content == valid_report
+    # m1 不合格后只调用一次（不再盲目重试），m2 调用一次
+    assert len(calls) == 2
+
+
+def test_call_llm_provider_continues_truncated_report(monkeypatch):
+    import analyzer
+
+    full_report = _build_valid_report()
+    marker = "## 三、市场与资产影响速查矩阵（Market Impact Matrix）"
+    head, tail_body = full_report.split(marker, 1)
+    partial = head.rstrip("\n")
+    tail = marker + tail_body
+
+    responses = [
+        (partial, "length"),
+        (tail, "stop"),
+    ]
+    calls = _make_fake_openai(monkeypatch, responses)
+
+    content, err = analyzer._call_llm_provider(
+        provider_name="FakeProvider",
+        api_key="sk-test",
+        base_url="https://example.com/v1",
+        candidate_models=["m1"],
+        prompt="prompt",
+    )
+
+    assert err is None
+    assert content == partial + "\n" + tail
+    assert len(calls) == 2
+    assert calls[1]["messages"][2]["role"] == "assistant"
+    assert calls[1]["messages"][2]["content"] == partial
+    assert "继续" in calls[1]["messages"][3]["content"]
+

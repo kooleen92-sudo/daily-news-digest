@@ -317,7 +317,8 @@ def execute_digest(*, dry_run: bool = False) -> None:
             }
 
             is_fallback = ("未启用大模型智能分析兜底模式" in report_markdown)
-            if not is_valid and not dry_run and not is_fallback:
+            is_no_news = status_record.get("total_articles", 0) == 0
+            if not is_valid and not dry_run and not is_fallback and not is_no_news:
                 issues_summary = "; ".join(integrity_issues) if integrity_issues else "no specific issues reported"
                 raise ValueError(f"Report integrity validation failed: {issues_summary}")
 

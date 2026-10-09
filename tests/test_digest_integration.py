@@ -79,3 +79,36 @@ def test_successful_delivery_records_history_after_send(tmp_path, monkeypatch):
     assert statuses[-1]["overall_status"] == "SUCCESS"
     assert pushed == [False]
     assert send_order == ["email", "history"]
+
+
+def test_no_news_run_still_delivers(tmp_path, monkeypatch):
+    sent = []
+
+    def successful_email(*args, **kwargs):
+        sent.append("email")
+
+    statuses, pushed = _patch_digest_dependencies(monkeypatch, tmp_path, send_email=successful_email)
+    monkeypatch.setattr(main, "collect_all_sources", lambda **kwargs: ({}, []))
+    monkeypatch.setattr(
+        main,
+        "analyze_news",
+        lambda articles, errors, market_quotes=None: "## 📭 今日暂无有效新闻\n\n各数据源本时段均无更新。",
+    )
+    monkeypatch.setattr(main, "validate_report_integrity", lambda report: (False, ["报告长度过短"]))
+
+    main.execute_digest(dry_run=False)
+
+    assert sent == ["email"]
+    assert statuses[-1]["overall_status"] == "SUCCESS"
+    assert pushed == [False]
+
+
+def test_invalid_report_with_articles_still_fails(tmp_path, monkeypatch):
+    statuses, pushed = _patch_digest_dependencies(monkeypatch, tmp_path, send_email=lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "validate_report_integrity", lambda report: (False, ["missing modules"]))
+
+    with pytest.raises(ValueError, match="Report integrity validation failed"):
+        main.execute_digest(dry_run=False)
+
+    assert statuses[-1]["overall_status"] == "FAILED"
+    assert pushed == []

@@ -53,6 +53,37 @@ def validate_and_sanitize_links(markdown_content: str, articles_by_source: dict[
     return re.sub(r"\[([^\]]+)\]\((https?://[^\s\)]+)\)", replace_link, markdown_content)
 
 
+def _heading_matches_module(line: str, number_tokens: tuple[str, ...], keywords: tuple[str, ...]) -> bool:
+    """Check whether a markdown line is a module heading with the given number and keyword.
+
+    Accepts ATX headings (#..######) and bold-only lines, tolerant to emoji,
+    emphasis markers, and both Chinese/Arabic module numbering styles.
+    """
+    raw = line.strip()
+    if not raw:
+        return False
+
+    is_atx = bool(re.match(r"^ {0,3}#{1,6}\s*\S", raw))
+    is_bold = raw.startswith("**") and raw.endswith("**") and len(raw) > 4
+    if not (is_atx or is_bold):
+        return False
+
+    text = re.sub(r"^ {0,3}#{1,6}\s*", "", raw).strip().strip("*_ ").strip()
+    if not text:
+        return False
+
+    head = text[:24]
+    number_alt = "|".join(re.escape(token) for token in number_tokens)
+    number_pattern = re.compile(
+        rf"(?:模块\s*(?:{number_alt})|第\s*(?:{number_alt})\s*[、\.：:]|(?:{number_alt})\s*(?:[、\.：:）\)，,]|\s+))"
+    )
+    if not number_pattern.search(head):
+        return False
+
+    lowered = text.lower()
+    return any(keyword.lower() in lowered for keyword in keywords)
+
+
 def validate_report_integrity(markdown_report: str) -> tuple[bool, list[str]]:
     """
     Validate that the generated markdown report meets structural integrity standards:
@@ -69,25 +100,16 @@ def validate_report_integrity(markdown_report: str) -> tuple[bool, list[str]]:
         issues.append(f"报告长度过短 (仅 {len(markdown_report.strip()) if markdown_report else 0} 字符)")
         return False, issues
 
-    # Module 1 Check
-    has_m1 = bool(re.search(r"##\s*.*一[、\s\.:].*(宏观|研判|Executive Summary)", markdown_report))
-    if not has_m1:
-        issues.append("缺失【模块一：今日宏观核心研判与前瞻】")
-
-    # Module 2 Check (CRITICAL)
-    has_m2 = bool(re.search(r"##\s*.*二[、\s\.:].*(个人投资|资产配置|Personal Allocation)", markdown_report))
-    if not has_m2:
-        issues.append("缺失【模块二：个人投资与大类资产配置实战指南】")
-
-    # Module 3 Check
-    has_m3 = bool(re.search(r"##\s*.*三[、\s\.:].*(市场|资产影响|速查矩阵|Market Impact Matrix)", markdown_report))
-    if not has_m3:
-        issues.append("缺失【模块三：市场与资产影响速查矩阵】")
-
-    # Module 4 Check
-    has_m4 = bool(re.search(r"##\s*.*四[、\s\.:].*(各家外媒|外媒精要|深度影响|In-Depth Analysis)", markdown_report))
-    if not has_m4:
-        issues.append("缺失【模块四：各家外媒精要与深度影响剖析】")
+    lines = markdown_report.splitlines()
+    module_specs = [
+        (("一", "1"), ("宏观", "研判", "Executive Summary"), "缺失【模块一：今日宏观核心研判与前瞻】"),
+        (("二", "2"), ("个人投资", "资产配置", "Personal Allocation"), "缺失【模块二：个人投资与大类资产配置实战指南】"),
+        (("三", "3"), ("市场", "资产影响", "速查矩阵", "Market Impact Matrix"), "缺失【模块三：市场与资产影响速查矩阵】"),
+        (("四", "4"), ("各家外媒", "外媒精要", "深度影响", "In-Depth Analysis"), "缺失【模块四：各家外媒精要与深度影响剖析】"),
+    ]
+    for number_tokens, keywords, missing_msg in module_specs:
+        if not any(_heading_matches_module(line, number_tokens, keywords) for line in lines):
+            issues.append(missing_msg)
 
     # Check for Markdown table presence
     has_table = bool(re.search(r"\|.+\|.+\|\n\|[-:\s|]+\|", markdown_report))
@@ -237,6 +259,60 @@ def generate_fallback_report(
     return "\n".join(lines)
 
 
+def generate_no_news_report(errors: list[str] | None = None, market_quotes: list[MarketQuote] | None = None) -> str:
+    """Generate a deliverable notice report when no articles were collected."""
+    lines = [
+        "## 📭 今日暂无有效新闻\n",
+        "本次执行未能从七大外媒抓取到符合条件的财经与中国相关新闻，"
+        "可能因数据源临时不可用、网络波动，或该时段确无符合条件的新内容。\n",
+    ]
+
+    if errors:
+        lines.append("**抓取诊断信息：**\n")
+        for err in errors:
+            lines.append(f"- {err}")
+        lines.append("")
+    else:
+        lines.append("各数据源本时段均无新增符合条件的内容。\n")
+
+    if market_quotes:
+        lines.append(render_market_table(market_quotes))
+        lines.append("")
+
+    lines.append(REPORT_DISCLAIMER)
+    return "\n".join(lines)
+
+
+def _continue_truncated_report(
+    client: OpenAI,
+    model_name: str,
+    max_tokens: int,
+    prompt: str,
+    partial_content: str,
+) -> str | None:
+    """Ask the model to continue a truncated report and return the merged text (fail-safe)."""
+    try:
+        continuation_messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": partial_content},
+            {"role": "user", "content": "请从中断处继续输出剩余内容，不要重复已输出部分。"},
+        ]
+        response = client.chat.completions.create(
+            model=model_name,
+            temperature=0.3,
+            max_tokens=max_tokens,
+            messages=continuation_messages,
+        )
+        continuation = (response.choices[0].message.content or "").strip()
+        if not continuation:
+            return None
+        return partial_content + "\n" + continuation
+    except Exception as exc:
+        log.warning("续写截断报告失败（忽略并继续降级流程）: %s: %s", type(exc).__name__, exc)
+        return None
+
+
 def _call_llm_provider(
     provider_name: str,
     api_key: str,
@@ -266,6 +342,7 @@ def _call_llm_provider(
     client = OpenAI(**client_kwargs)
     last_error: Exception | None = None
     best_partial_content: str | None = None
+    continuation_used = False
 
     for cand_model in candidate_models:
         model_name = cand_model.strip()
@@ -291,17 +368,29 @@ def _call_llm_provider(
                     content_clean = content.strip()
                     is_valid, _ = validate_report_integrity(content_clean)
 
-                    # 最佳情况：完整生成且通过完整性校验
-                    if is_valid and finish_reason != "length":
-                        log.info("[%s] 成功生成完整分析报告！模型: %s", provider_name, model_name)
-                        return content_clean, None
-
-                    # 触及 token 上限时的容错处理
-                    elif finish_reason == "length":
+                    # 触及 token 上限时的容错处理：优先续写拼接，其次保留最优部分内容
+                    if finish_reason == "length":
                         if is_valid:
                             log.warning("[%s] 模型 '%s' 输出触及 token 上限，但已完整包含全部核心模块（字数: %d），予以采纳！",
                                         provider_name, model_name, len(content_clean))
                             return content_clean, None
+
+                        if not continuation_used:
+                            continuation_used = True
+                            combined = _continue_truncated_report(
+                                client=client,
+                                model_name=model_name,
+                                max_tokens=max_tokens,
+                                prompt=prompt,
+                                partial_content=content_clean,
+                            )
+                            if combined:
+                                combined_valid, _ = validate_report_integrity(combined)
+                                if combined_valid:
+                                    log.warning("[%s] 模型 '%s' 截断输出经一次续写拼接后通过完整性校验（字数: %d），予以采纳！",
+                                                provider_name, model_name, len(combined))
+                                    return combined, None
+                                content_clean = combined
 
                         if not best_partial_content or len(content_clean) > len(best_partial_content):
                             best_partial_content = content_clean
@@ -309,9 +398,15 @@ def _call_llm_provider(
                         log.warning("[%s] 模型 '%s' 输出触及 token 上限且未完整生成四大核心模块，准备切换下一个候选模型...", provider_name, model_name)
                         break  # 切换到下一个候选模型，避免无谓重试相同被截断的模型
 
-                    elif is_valid:
-                        log.info("[%s] 成功生成分析报告！模型: %s", provider_name, model_name)
+                    # 正常结束且通过完整性校验
+                    if is_valid:
+                        log.info("[%s] 成功生成完整分析报告！模型: %s", provider_name, model_name)
                         return content_clean, None
+
+                    # 正常结束但结构校验未通过：不再用相同 prompt 盲目重试，直接切换候选模型
+                    log.warning("[%s] 模型 '%s' 返回内容未通过结构完整性校验，跳过重复重试并切换下一候选模型。",
+                                provider_name, model_name)
+                    break
 
             except openai.AuthenticationError as exc:
                 log.error("[%s] 鉴权失败 (API Key 无效或未授权): %s", provider_name, exc)
@@ -375,7 +470,8 @@ def analyze_news(
     """
     total_articles = sum(len(items) for items in articles_by_source.values())
     if total_articles == 0:
-        return "## 暂无新闻\n\n过去 24 小时未抓取到符合条件的财经及中国大陆新闻。"
+        log.warning("本次未抓取到任何有效新闻，生成无新闻说明报告（仍将按正常流程投递）。")
+        return generate_no_news_report(errors, market_quotes=market_quotes)
 
     market_context = format_market_context_for_prompt(market_quotes) if market_quotes else "（未提供实时行情数据）"
     market_table = render_market_table(market_quotes) if market_quotes else ""
@@ -405,10 +501,36 @@ def analyze_news(
         if content:
             is_valid, issues = validate_report_integrity(content)
             if not is_valid:
-                warn_msg = f"{p['name']} 生成内容未通过完整性校验 ({'; '.join(issues)})"
-                log.warning("%s。准备切换下一个引擎重新生成完整报告...", warn_msg)
-                errors.append(warn_msg)
-                continue
+                log.warning("%s 生成内容未通过完整性校验 (%s)，尝试一次结构修复重写...", p["name"], "; ".join(issues))
+                repair_prompt = (
+                    prompt
+                    + "\n\n【结构修复要求】你上一次输出未通过结构完整性校验，缺失或不合规的内容："
+                    + "; ".join(issues)
+                    + "。请严格按上述四大模块的标题格式重新完整输出全部内容，不要省略任何模块。"
+                )
+                repaired, repair_err = _call_llm_provider(
+                    provider_name=p["name"],
+                    api_key=p["api_key"],
+                    base_url=p["base_url"],
+                    candidate_models=p["candidates"],
+                    prompt=repair_prompt,
+                )
+                if repaired:
+                    repaired_valid, repaired_issues = validate_report_integrity(repaired)
+                    if repaired_valid:
+                        log.info("[%s] 结构修复重写成功，采纳修复后的完整报告。", p["name"])
+                        content = repaired
+                        is_valid = True
+                    else:
+                        issues = repaired_issues
+                else:
+                    log.warning("[%s] 结构修复重写调用失败: %s: %s", p["name"], type(repair_err).__name__, repair_err)
+
+                if not is_valid:
+                    warn_msg = f"{p['name']} 生成内容未通过完整性校验 ({'; '.join(issues)})"
+                    log.warning("%s。准备切换下一个引擎重新生成完整报告...", warn_msg)
+                    errors.append(warn_msg)
+                    continue
 
             cleaned_content = validate_and_sanitize_links(content, articles_by_source)
             footer_note = f"\n\n---\n*🤖 本期研报由 {p['name']} 智能引擎分析生成*"

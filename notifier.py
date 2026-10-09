@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
 import requests
@@ -16,10 +17,35 @@ import requests
 log = logging.getLogger("daily-news")
 
 
+def _truncate_by_bytes(text: str, max_bytes: int) -> str:
+    """Truncate text so that its UTF-8 byte length stays within max_bytes.
+
+    Multi-byte characters are never split; a trailing ellipsis is appended when truncation occurs.
+    """
+    if not text or max_bytes <= 0:
+        return ""
+    raw = text.encode("utf-8")
+    if len(raw) <= max_bytes:
+        return text
+
+    ellipsis = "…"
+    budget = max_bytes - len(ellipsis.encode("utf-8"))
+    if budget <= 0:
+        return ""
+
+    truncated = raw[:budget]
+    while truncated:
+        try:
+            return truncated.decode("utf-8") + ellipsis
+        except UnicodeDecodeError:
+            truncated = truncated[:-1]
+    return ""
+
+
 def send_wecom_webhook(webhook_url: str, title: str, markdown_text: str) -> bool:
     """Send markdown notification to WeChat Work (企业微信) webhook."""
     try:
-        content = f"### {title}\n\n{markdown_text[:3500]}"
+        content = _truncate_by_bytes(f"### {title}\n\n{markdown_text}", 4000)
         payload = {
             "msgtype": "markdown",
             "markdown": {"content": content}
@@ -48,7 +74,7 @@ def send_feishu_webhook(webhook_url: str, title: str, markdown_text: str) -> boo
                 "elements": [
                     {
                         "tag": "div",
-                        "text": {"tag": "lark_md", "content": markdown_text[:3500]}
+                        "text": {"tag": "lark_md", "content": _truncate_by_bytes(markdown_text, 20000)}
                     }
                 ]
             }
@@ -71,7 +97,7 @@ def send_dingtalk_webhook(webhook_url: str, title: str, markdown_text: str) -> b
             "msgtype": "markdown",
             "markdown": {
                 "title": title,
-                "text": f"### {title}\n\n{markdown_text[:3500]}"
+                "text": _truncate_by_bytes(f"### {title}\n\n{markdown_text}", 18000)
             }
         }
         resp = requests.post(webhook_url, json=payload, timeout=10)
@@ -89,7 +115,7 @@ def send_serverchan_notice(key: str, title: str, markdown_text: str) -> bool:
     """Send notification via ServerChan (Server酱)."""
     try:
         url = f"https://sctapi.ftqq.com/{key.strip()}.send"
-        resp = requests.post(url, data={"title": title[:100], "desp": markdown_text[:5000]}, timeout=10)
+        resp = requests.post(url, data={"title": title[:100], "desp": _truncate_by_bytes(markdown_text, 20000)}, timeout=10)
         resp_json = resp.json()
         if resp_json.get("code") == 0:
             log.info("Server酱推送成功！")
@@ -106,10 +132,15 @@ def send_telegram_notice(bot_token: str, chat_id: str, title: str, markdown_text
     try:
         url = f"https://api.telegram.org/bot{bot_token.strip()}/sendMessage"
         safe_title = html.escape(title)
-        safe_body = html.escape(markdown_text[:3500])
+        safe_body = html.escape(markdown_text)
+        text = f"<b>{safe_title}</b>\n\n{safe_body}"
+        if len(text) > 4096:
+            text = text[:4096]
+            # 去除截断处可能残留的不完整 HTML 实体（如 &amp; 被切成 &am）
+            text = re.sub(r"&[a-zA-Z#0-9]*$", "", text)
         payload = {
             "chat_id": chat_id.strip(),
-            "text": f"<b>{safe_title}</b>\n\n{safe_body}",
+            "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         }

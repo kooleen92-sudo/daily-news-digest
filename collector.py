@@ -19,6 +19,7 @@ from __future__ import annotations
 import calendar
 import difflib
 import html
+import json
 import logging
 import re
 import urllib.parse
@@ -605,6 +606,131 @@ def _fetch_source_declarative(
     return candidates[:max_per_source]
 
 
+GOOGLE_NEWS_BATCHEXECUTE_URL = "https://news.google.com/_/DotsSplashUi/data/batchexecute"
+
+
+def _extract_google_news_article_id(url: str) -> str | None:
+    """Extract the article id from a Google News RSS redirect URL."""
+    if not url:
+        return None
+    try:
+        parsed = urllib.parse.urlparse(url.strip())
+    except Exception:
+        return None
+    if "news.google.com" not in parsed.netloc.lower():
+        return None
+    match = re.search(r"/(?:rss/)?articles/([^/?#]+)", parsed.path)
+    if not match:
+        return None
+    return match.group(1) or None
+
+
+def _parse_google_news_page(html_text: str) -> tuple[str | None, str | None]:
+    """Extract the signature and timestamp tokens from a Google News article page."""
+    if not html_text:
+        return None, None
+    signature_match = re.search(r'data-n-a-sg="([^"]+)"', html_text)
+    timestamp_match = re.search(r'data-n-a-ts="([^"]+)"', html_text)
+    signature = signature_match.group(1) if signature_match else None
+    timestamp = timestamp_match.group(1) if timestamp_match else None
+    return signature, timestamp
+
+
+def _decode_google_news_response(response_text: str) -> str | None:
+    """Decode the publisher URL from a Google News batchexecute response."""
+    if not response_text:
+        return None
+    marker_index = response_text.find("garturlres")
+    if marker_index == -1:
+        return None
+    tail = response_text[marker_index:].replace("\\/", "/")
+    for match in re.finditer(r'https?://[^\s"\\\]\}]+', tail):
+        candidate = match.group(0)
+        if "news.google.com" not in candidate:
+            return candidate
+    return None
+
+
+def resolve_google_news_url(url: str, timeout: float = 5.0) -> str | None:
+    """Resolve a Google News RSS redirect URL to the publisher's real URL (fail-safe)."""
+    try:
+        article_id = _extract_google_news_article_id(url)
+        if not article_id:
+            return None
+
+        page_response = _SESSION.get(
+            f"https://news.google.com/rss/articles/{article_id}",
+            headers={"User-Agent": DEFAULT_USER_AGENT},
+            timeout=timeout,
+        )
+        if page_response.status_code != 200:
+            return None
+
+        signature, timestamp = _parse_google_news_page(page_response.text)
+        if not signature or not timestamp:
+            return None
+
+        inner_payload = (
+            '["garturlreq",[["X","X",["X","X"],null,null,1,1,"US:en",null,1,'
+            'null,null,null,null,null,0,1],"X","X",1,[1,1,1],1,1,null,0,0,null,0],'
+            f'"{article_id}",{timestamp},"{signature}"]'
+        )
+        form_data = [("f.req", json.dumps([[["Fbv4je", inner_payload, None, "generic"]]]))]
+        api_response = _SESSION.post(
+            GOOGLE_NEWS_BATCHEXECUTE_URL,
+            data=form_data,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+                "User-Agent": DEFAULT_USER_AGENT,
+            },
+            timeout=timeout,
+        )
+        if api_response.status_code != 200:
+            return None
+
+        decoded = _decode_google_news_response(api_response.text)
+        if decoded and decoded.startswith("http") and "news.google.com" not in decoded:
+            return decoded
+        return None
+    except Exception as exc:
+        log.debug("Google News 链接解析失败 [%s]: %s", url, exc)
+        return None
+
+
+def resolve_google_news_urls(
+    articles: list[NewsArticle],
+    max_workers: int = 6,
+    time_budget: float = 20.0,
+) -> int:
+    """Resolve Google News redirect URLs to publisher URLs in-place (bounded by a time budget)."""
+    targets = [article for article in articles if _extract_google_news_article_id(article.url)]
+    if not targets:
+        return 0
+
+    resolved_count = 0
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        future_to_article = {executor.submit(resolve_google_news_url, article.url): article for article in targets}
+        try:
+            for future in as_completed(future_to_article, timeout=time_budget):
+                article = future_to_article[future]
+                try:
+                    real_url = future.result()
+                except Exception:
+                    real_url = None
+                if real_url and "news.google.com" not in real_url:
+                    article.url = real_url
+                    resolved_count += 1
+        except TimeoutError:
+            log.debug("Google News 链接解析超出 %.0f 秒时间预算，未完成部分保留原链接。", time_budget)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    if resolved_count:
+        log.info("已将 %d/%d 条 Google News 跳转链接解析为发布方原文链接。", resolved_count, len(targets))
+    return resolved_count
+
+
 def collect_all_sources(lookback_hours: int = 24, max_per_source: int = 6) -> tuple[dict[str, list[NewsArticle]], list[str]]:
     """
     Collect news from all 7 media outlets in parallel using ThreadPoolExecutor.
@@ -646,5 +772,9 @@ def collect_all_sources(lookback_hours: int = 24, max_per_source: int = 6) -> tu
             except Exception as e:
                 log.warning("抓取源 [%s] 异常: %s", src, e)
                 errors.append(f"{src}：抓取异常 ({type(e).__name__})")
+
+    if config.resolve_google_news:
+        all_articles = [article for items in results.values() for article in items]
+        resolve_google_news_urls(all_articles)
 
     return results, errors

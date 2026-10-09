@@ -194,3 +194,82 @@ def test_deduplicate_articles_fuzzy_and_antonym():
     assert len(deduped_opp) == 2
 
 
+def test_extract_google_news_article_id():
+    from collector import _extract_google_news_article_id
+
+    assert _extract_google_news_article_id("https://news.google.com/rss/articles/CBMiABC?hl=zh-CN&gl=CN") == "CBMiABC"
+    assert _extract_google_news_article_id("https://news.google.com/rss/articles/CBMiXYZ") == "CBMiXYZ"
+    assert _extract_google_news_article_id("https://www.reuters.com/world/example") is None
+    assert _extract_google_news_article_id("") is None
+
+
+def test_parse_google_news_page():
+    from collector import _parse_google_news_page
+
+    html_fragment = '<c-wiz><div data-n-a-sg="SIG123" data-n-a-ts="1712345678">x</div></c-wiz>'
+    assert _parse_google_news_page(html_fragment) == ("SIG123", "1712345678")
+    assert _parse_google_news_page("<html></html>") == (None, None)
+    assert _parse_google_news_page("") == (None, None)
+
+
+def test_decode_google_news_response():
+    from collector import _decode_google_news_response
+
+    sample = (
+        ")]}'\n\n"
+        '[["wrb.fr","Fbv4je","[[\\"garturlres\\",\\"https://www.reuters.com/world/example\\",null,1]]",null,null,null,"generic"]]'
+    )
+    assert _decode_google_news_response(sample) == "https://www.reuters.com/world/example"
+    assert _decode_google_news_response("garbage without marker") is None
+    assert _decode_google_news_response("") is None
+
+
+def test_resolve_google_news_url_success(monkeypatch):
+    import collector
+
+    page_html = '<c-wiz><div data-n-a-sg="SIG123" data-n-a-ts="1712345678"></div></c-wiz>'
+    api_text = (
+        ")]}'\n\n"
+        '[["wrb.fr","Fbv4je","[[\\"garturlres\\",\\"https://www.bloomberg.com/news/articles/x\\"]]",null,null,null,"generic"]]'
+    )
+
+    class _Resp:
+        def __init__(self, text):
+            self.text = text
+            self.status_code = 200
+
+    monkeypatch.setattr(collector._SESSION, "get", lambda *args, **kwargs: _Resp(page_html))
+    monkeypatch.setattr(collector._SESSION, "post", lambda *args, **kwargs: _Resp(api_text))
+
+    resolved = collector.resolve_google_news_url("https://news.google.com/rss/articles/CBMiABC?hl=zh-CN")
+    assert resolved == "https://www.bloomberg.com/news/articles/x"
+
+
+def test_resolve_google_news_url_fail_safe(monkeypatch):
+    import collector
+
+    def raising_get(*args, **kwargs):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(collector._SESSION, "get", raising_get)
+    assert collector.resolve_google_news_url("https://news.google.com/rss/articles/CBMiABC") is None
+    assert collector.resolve_google_news_url("https://www.reuters.com/world/example") is None
+
+
+def test_resolve_google_news_urls_replaces_in_place(monkeypatch):
+    import collector
+    from collector import NewsArticle
+
+    now = datetime.now(timezone.utc)
+    articles = [
+        NewsArticle(source="路透社", title="t1", url="https://news.google.com/rss/articles/AAA", summary="", published_at=now),
+        NewsArticle(source="路透社", title="t2", url="https://www.reuters.com/direct", summary="", published_at=now),
+    ]
+    monkeypatch.setattr(collector, "resolve_google_news_url", lambda url, timeout=5.0: "https://www.reuters.com/real-article")
+
+    count = collector.resolve_google_news_urls(articles, max_workers=2, time_budget=5.0)
+    assert count == 1
+    assert articles[0].url == "https://www.reuters.com/real-article"
+    assert articles[1].url == "https://www.reuters.com/direct"
+
+

@@ -95,3 +95,11 @@ def test_get_config_reload():
     cfg2 = get_config(reload=True)
     assert cfg1.digest_time == cfg2.digest_time
 
+
+def test_resolve_google_news_config(monkeypatch):
+    monkeypatch.delenv("RESOLVE_GOOGLE_NEWS", raising=False)
+    assert AppConfig.load().resolve_google_news is True
+
+    monkeypatch.setenv("RESOLVE_GOOGLE_NEWS", "false")
+    assert AppConfig.load().resolve_google_news is False
+

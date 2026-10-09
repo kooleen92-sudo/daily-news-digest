@@ -63,6 +63,9 @@ class AppConfig:
     output_retention_days: int = 7
     compress_image: bool = True
 
+    # Collector Settings
+    resolve_google_news: bool = True
+
     # Externalized Topics & Persona Configuration (from config/topics.yaml)
     topics_config: dict[str, Any] = field(default_factory=dict)
 
@@ -234,6 +237,7 @@ class AppConfig:
             dedupe_similarity=get_float("DEDUPE_SIMILARITY", 0.85),
             output_retention_days=get_int("OUTPUT_RETENTION_DAYS", 7),
             compress_image=get_bool("COMPRESS_IMAGE", True),
+            resolve_google_news=get_bool("RESOLVE_GOOGLE_NEWS", True),
             openai_api_key=openai_key,
             openai_base_url=openai_base,
             llm_model=openai_model or "gpt-4o-mini",
