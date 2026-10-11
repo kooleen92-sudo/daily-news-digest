@@ -301,14 +301,18 @@ def send_digest_email(body_markdown: str, errors: list[str], image_path: Path | 
                     with smtplib.SMTP_SSL(config.smtp_host, config.smtp_port, timeout=30) as smtp:
                         if config.smtp_user and config.smtp_password:
                             smtp.login(config.smtp_user, config.smtp_password)
-                        smtp.send_message(msg)
+                        refused = smtp.send_message(msg)
+                        if refused:
+                            log.warning("部分收件人投递被服务器拒绝: %s", refused)
                 else:
                     with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=30) as smtp:
                         if config.smtp_use_tls:
                             smtp.starttls()
                         if config.smtp_user and config.smtp_password:
                             smtp.login(config.smtp_user, config.smtp_password)
-                        smtp.send_message(msg)
+                        refused = smtp.send_message(msg)
+                        if refused:
+                            log.warning("部分收件人投递被服务器拒绝: %s", refused)
                 return
             except (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, TimeoutError, OSError) as e:
                 if attempt < max_attempts - 1:
@@ -352,7 +356,8 @@ def send_digest_email(body_markdown: str, errors: list[str], image_path: Path | 
         else:
             raise exc
 
-    log.info("Email successfully sent to %s!", config.mail_to)
+    target_str = ", ".join(config.recipient_list) if config.recipient_list else config.mail_to
+    log.info("Email successfully sent to %s!", target_str)
 
 
 def test_smtp_connection() -> bool:

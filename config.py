@@ -170,7 +170,7 @@ class AppConfig:
         """Return parsed list of recipient email addresses."""
         if not self.mail_to:
             return []
-        return [addr.strip() for addr in re.split(r"[;,]", self.mail_to) if addr.strip()]
+        return [addr.strip() for addr in re.split(r"[,;，；\s]+", self.mail_to) if addr.strip()]
 
 
     @classmethod

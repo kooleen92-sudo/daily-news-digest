@@ -413,7 +413,8 @@ def run_scheduler() -> None:
     target_time = config.digest_time  # e.g. "08:00"
     log.info("启动定时任务守护进程...")
     log.info("每天早晨 %s (%s) 准时执行抓取与邮件推送任务", target_time, config.digest_timezone)
-    log.info("收件人: %s | 大模型: %s", config.mail_to or "(未设置)", config.llm_model)
+    target_recipients = ", ".join(config.recipient_list) if config.recipient_list else (config.mail_to or "(未设置)")
+    log.info("收件人: %s | 大模型: %s", target_recipients, config.llm_model)
     log.info("按 Ctrl + C 可终止守护进程。\n")
 
     def job():
@@ -461,7 +462,8 @@ def main() -> None:
     if args.test_mail:
         log.info("正在测试 SMTP 邮箱连接...")
         if test_smtp_connection():
-            log.info("SMTP 验证成功！正在向 %s 发送测试邮件...", config.mail_to)
+            target_recipients = ", ".join(config.recipient_list) if config.recipient_list else config.mail_to
+            log.info("SMTP 验证成功！正在向 %s 发送测试邮件...", target_recipients)
             test_content = (
                 "## 这是一个测试邮件\n\n"
                 "您的每日财经与中国深度简报服务邮件配置已生效！\n\n"

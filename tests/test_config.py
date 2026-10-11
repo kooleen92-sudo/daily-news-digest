@@ -117,3 +117,21 @@ def test_llm_max_tokens_config(monkeypatch):
     assert custom_cfg.llm_max_tokens == 4096
     assert custom_cfg.llm_max_tokens_large == 12288
 
+
+def test_recipient_list_parsing():
+    # Empty
+    cfg_empty = AppConfig(mail_to="")
+    assert cfg_empty.recipient_list == []
+
+    # Single
+    cfg_single = AppConfig(mail_to="user@example.com")
+    assert cfg_single.recipient_list == ["user@example.com"]
+
+    # Multiple with English commas and whitespace
+    cfg_multi_comma = AppConfig(mail_to="user1@qq.com, user2@163.com,  user3@gmail.com ")
+    assert cfg_multi_comma.recipient_list == ["user1@qq.com", "user2@163.com", "user3@gmail.com"]
+
+    # Multiple with semicolons and Chinese commas/semicolons
+    cfg_multi_cn = AppConfig(mail_to="user1@qq.com；user2@163.com，user3@gmail.com;user4@outlook.com")
+    assert cfg_multi_cn.recipient_list == ["user1@qq.com", "user2@163.com", "user3@gmail.com", "user4@outlook.com"]
+
