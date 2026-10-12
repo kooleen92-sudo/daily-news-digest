@@ -7,6 +7,12 @@ on:
     # 容灾备用触发：北京时间 08:05 (UTC 00:05)，若主触发已成功则自动跳过，若主触发偶发丢失则自动兜底补发
     - cron: '5 0 * * *'
   workflow_dispatch: # 支持在 GitHub 页面上手动点击按钮立即测试触发
+    inputs:
+      dry_run:
+        description: '仅执行预览（不发送邮件与通知，产物保存于 Actions Artifacts）'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   actions: read
@@ -119,7 +125,12 @@ jobs:
           OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
         run: |
-          python main.py --run-now
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "::notice::Executing in dry-run mode (preview only, no email dispatched)..."
+            python main.py --dry-run
+          else
+            python main.py --run-now
+          fi
 
 
       - name: Archive Generated Digest

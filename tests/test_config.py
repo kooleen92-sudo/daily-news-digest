@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """Unit tests for configuration routing and provider detection."""
 
+import logging
 import os
+import config
 from config import AppConfig
 
 
@@ -14,8 +16,39 @@ def test_provider_detection_gemini():
     providers = cfg.get_configured_providers()
     assert len(providers) >= 1
     assert providers[0]["name"] == "Google Gemini"
-    assert providers[0]["model"] in {"gemini-3.5-flash", "gemini-3.8-flash"}
-    assert "gemini-3.5-flash" in providers[0]["candidates"]
+    assert providers[0]["model"] == "gemini-3.8-flash"
+    assert "gemini-3.8-flash" in providers[0]["candidates"]
+    assert "gemini-3.7-flash" in providers[0]["candidates"]
+    assert "gemini-3.6-flash" in providers[0]["candidates"]
+    assert "gemini-3.5-flash" not in providers[0]["candidates"]
+
+
+def test_deprecated_gemini_model_warns_and_keeps_fallbacks(caplog):
+    os.environ["GEMINI_API_KEY"] = "AIzaSyTestKey123"
+    os.environ["GEMINI_MODEL"] = "gemini-3.5-flash"
+    os.environ["DEEPSEEK_API_KEY"] = ""
+    os.environ["OPENAI_API_KEY"] = ""
+    config._warned_deprecated_gemini.clear()
+    try:
+        with caplog.at_level(logging.WARNING):
+            cfg = AppConfig.load()
+            providers = cfg.get_configured_providers()
+    finally:
+        os.environ["GEMINI_MODEL"] = ""
+    assert cfg.deprecated_gemini_model() == "gemini-3.5-flash"
+    assert any("弃用" in rec.getMessage() and "gemini-3.5-flash" in rec.getMessage() for rec in caplog.records)
+    candidates = providers[0]["candidates"]
+    assert candidates[0] == "gemini-3.5-flash"          # 用户显式配置优先，不被静默改写
+    assert "gemini-3.8-flash" in candidates             # 新版模型仍在候选池，保证降级
+    assert "gemini-3.6-flash" in candidates
+
+
+def test_non_deprecated_gemini_model_does_not_warn(caplog):
+    cfg = AppConfig(gemini_api_key="AIzaSyValidKey", gemini_model="gemini-3.8-flash")
+    with caplog.at_level(logging.WARNING):
+        providers = cfg.get_configured_providers()
+    assert cfg.deprecated_gemini_model() is None
+    assert caplog.records == []
     assert "gemini-3.8-flash" in providers[0]["candidates"]
 
 

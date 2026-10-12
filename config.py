@@ -6,6 +6,7 @@ Reads settings from environment variables and .env file.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
@@ -21,6 +22,23 @@ if ENV_PATH.exists():
     load_dotenv(ENV_PATH)
 else:
     load_dotenv()
+
+
+# 官方弃用清单: https://ai.google.dev/gemini-api/docs/deprecations
+DEPRECATED_GEMINI_MODELS = frozenset({
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-3-pro-preview",
+    "gemini-3.1-flash-lite-preview",
+})
+
+log = logging.getLogger("daily-news")
+
+# 同一次运行内，同一弃用模型只告警一次（get_configured_providers 会被多次调用）
+_warned_deprecated_gemini: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -44,7 +62,7 @@ class AppConfig:
     # Dedicated Gemini Settings (Priority 1)
     gemini_api_key: str = ""
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
-    gemini_model: str = "gemini-3.5-flash"
+    gemini_model: str = "gemini-3.8-flash"
 
     # Dedicated DeepSeek Settings (Priority 2 / Fallback)
     deepseek_api_key: str = ""
@@ -72,14 +90,28 @@ class AppConfig:
     topics_config: dict[str, Any] = field(default_factory=dict)
 
 
+    def deprecated_gemini_model(self) -> str | None:
+        """Return the configured Gemini model if it is on the official deprecation list."""
+        if self.gemini_model and self.gemini_model.strip().lower() in DEPRECATED_GEMINI_MODELS:
+            return self.gemini_model.strip()
+        return None
+
     def get_configured_providers(self) -> list[dict[str, Any]]:
         """Return configured LLM providers in priority order with deduplicated candidates."""
         providers = []
 
         # Tier 1: Gemini
         if self.gemini_api_key:
+            deprecated = self.deprecated_gemini_model()
+            if deprecated and deprecated not in _warned_deprecated_gemini:
+                _warned_deprecated_gemini.add(deprecated)
+                log.warning(
+                    "GEMINI_MODEL '%s' 已被 Google 官方弃用，请求可能被自动路由或直接失败；"
+                    "建议改用 gemini-3.8-flash。当前仍会优先尝试该模型，失败后自动降级到候选池中的新版模型。",
+                    deprecated,
+                )
             gemini_candidates = []
-            for m in [self.gemini_model, "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash"]:
+            for m in [self.gemini_model, "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.1-pro"]:
                 if m and m not in gemini_candidates:
                     gemini_candidates.append(m)
             providers.append({
@@ -215,7 +247,7 @@ class AppConfig:
             openai_base if "googleapis.com" in openai_base_lower else "https://generativelanguage.googleapis.com/v1beta/openai/"
         )
         gemini_model = os.getenv("GEMINI_MODEL", "").strip() or (
-            openai_model if "gemini" in openai_model.lower() else "gemini-3.5-flash"
+            openai_model if "gemini" in openai_model.lower() else "gemini-3.8-flash"
         )
 
         # Dedicated DeepSeek configuration
