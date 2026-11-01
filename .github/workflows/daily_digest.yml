@@ -30,23 +30,47 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Check If Already Sent Today (Idempotency Guard)
+        id: check_sent
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TODAY_BJT=$(TZ='Asia/Shanghai' date +'%Y-%m-%d')
+          LATEST_UTC=$(gh run list --workflow=daily_digest.yml --branch main --status=success --limit=1 --json createdAt -q '.[0].createdAt' || echo "")
+          if [ -n "$LATEST_UTC" ] && [ "$LATEST_UTC" != "null" ]; then
+            LATEST_BJT=$(TZ='Asia/Shanghai' date -d "$LATEST_UTC" +'%Y-%m-%d' 2>/dev/null || echo "")
+            if [ "$LATEST_BJT" = "$TODAY_BJT" ]; then
+              echo "今日 ($TODAY_BJT) 早报已成功发送过，跳过本次执行防止重复。"
+              echo "already_sent=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+          echo "今日 ($TODAY_BJT) 尚未成功发送，正常启动抓取与研报推送流程。"
+          echo "already_sent=false" >> $GITHUB_OUTPUT
+
       - name: Set up Python
+        if: steps.check_sent.outputs.already_sent != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
 
       - name: Install System Fonts & Python Dependencies
+        if: steps.check_sent.outputs.already_sent != 'true'
         run: |
           sudo apt-get update && sudo apt-get install -y fonts-noto-cjk fonts-wqy-zenhei fonts-wqy-microhei
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Get Playwright Version
+        if: steps.check_sent.outputs.already_sent != 'true'
         run: |
           echo "PLAYWRIGHT_VERSION=$(pip show playwright | grep Version | cut -d' ' -f2)" >> $GITHUB_ENV
 
       - name: Cache Playwright Browsers
+        if: steps.check_sent.outputs.already_sent != 'true'
         uses: actions/cache@v4
         id: playwright-cache
         with:
@@ -54,6 +78,7 @@ jobs:
           key: ${{ runner.os }}-playwright-${{ env.PLAYWRIGHT_VERSION }}
 
       - name: Install Playwright Browsers & Deps
+        if: steps.check_sent.outputs.already_sent != 'true'
         run: |
           if [ "${{ steps.playwright-cache.outputs.cache-hit }}" != "true" ]; then
             python -m playwright install --with-deps chromium
@@ -62,27 +87,8 @@ jobs:
             python -m playwright install chromium
           fi
 
-      - name: Check If Already Sent Today (Idempotency Guard)
-        id: check_sent
-        if: github.event_name == 'schedule'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          LATEST_TIME=$(gh run list --workflow=daily_digest.yml --status=success --limit=1 --json createdAt -q '.[0].createdAt' || echo "")
-          if [ -n "$LATEST_TIME" ]; then
-            NOW_EPOCH=$(date +%s)
-            RUN_EPOCH=$(date -d "$LATEST_TIME" +%s 2>/dev/null || echo 0)
-            DIFF_MIN=$(( (NOW_EPOCH - RUN_EPOCH) / 60 ))
-            if [ $DIFF_MIN -ge 0 ] && [ $DIFF_MIN -lt 90 ]; then
-              echo "今日早报已于 $DIFF_MIN 分钟前成功发送，跳过执行以防重复推送。"
-              echo "already_sent=true" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-          fi
-          echo "今日尚未成功发送，正常启动抓取与研报推送流程。"
-          echo "already_sent=false" >> $GITHUB_OUTPUT
-
       - name: Restore Digest History and Archive
+        if: steps.check_sent.outputs.already_sent != 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -140,7 +146,7 @@ jobs:
 
       - name: Archive Generated Digest
         uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.check_sent.outputs.already_sent != 'true'
         with:
           name: daily-digest-output
           path: output/
