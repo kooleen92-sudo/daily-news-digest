@@ -6,8 +6,13 @@ on:
     - cron: '5 23 * * *'
     # 容灾备用触发：北京时间 07:45 (UTC 23:45)，避开 00:00 整点，若主触发已成功则自动跳过，保障 8 点前准时送达
     - cron: '45 23 * * *'
-  workflow_dispatch: # 支持在 GitHub 页面上手动点击按钮立即测试触发
+  workflow_dispatch: # 支持在 GitHub 页面上手动点击按钮立即测试触发，或外部 Webhook 触发
     inputs:
+      force:
+        description: '忽略今日已发送检查，强制重新生成并发送'
+        required: false
+        default: false
+        type: boolean
       dry_run:
         description: '仅执行预览（不发送邮件与通知，产物保存于 Actions Artifacts）'
         required: false
@@ -32,11 +37,24 @@ jobs:
 
       - name: Check If Already Sent Today (Idempotency Guard)
         id: check_sent
-        if: github.event_name == 'schedule'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          FORCE_RUN: ${{ inputs.force }}
+          IS_DRY_RUN: ${{ inputs.dry_run }}
         run: |
+          if [ "$FORCE_RUN" = "true" ]; then
+            echo "::notice::检测到 force=true 强制运行参数，跳过幂等检查，强制执行。"
+            echo "already_sent=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if [ "$IS_DRY_RUN" = "true" ]; then
+            echo "::notice::检测到 dry_run=true 预览参数，跳过幂等检查，正常执行预览。"
+            echo "already_sent=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           TODAY_BJT=$(TZ='Asia/Shanghai' date +'%Y-%m-%d')
           LATEST_UTC=$(gh run list --workflow=daily_digest.yml --branch main --status=success --limit=1 --json createdAt -q '.[0].createdAt' || echo "")
           if [ -n "$LATEST_UTC" ] && [ "$LATEST_UTC" != "null" ]; then
