@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 Multi-channel notification dispatcher.
-Supports WeCom (企业微信), Feishu (飞书), DingTalk (钉钉), ServerChan (Server酱), and Telegram Bot,
+Supports WeCom (企业微信), Feishu (飞书), DingTalk (钉钉), ServerChan (Server酱),
+Telegram Bot, NapCatQQ / OneBot (QQ群), and Windows PC WeChat personal groups,
 providing resilient multi-channel delivery and automatic failover when SMTP encounters disruptions.
 """
 
@@ -156,7 +157,71 @@ def send_telegram_notice(bot_token: str, chat_id: str, title: str, markdown_text
     return False
 
 
-def dispatch_webhooks(title: str, markdown_text: str) -> dict[str, bool]:
+def send_onebot_qq_group(
+    api_url: str,
+    group_id: int | str,
+    title: str,
+    markdown_text: str,
+    image_path: Path | str | None = None,
+    access_token: str = "",
+) -> bool:
+    """Send digest text and optional rendered long image to a QQ group via OneBot v11 HTTP API (e.g. NapCatQQ)."""
+    try:
+        url = api_url.rstrip("/")
+        if not url.endswith("/send_group_msg"):
+            url = f"{url}/send_group_msg"
+
+        headers = {"Content-Type": "application/json"}
+        if access_token:
+            headers["Authorization"] = f"Bearer {access_token.strip()}"
+
+        summary_text = _truncate_by_bytes(f"【{title}】\n\n{markdown_text}", 3000)
+        messages: list[dict[str, Any]] = [
+            {"type": "text", "data": {"text": summary_text}}
+        ]
+
+        if image_path:
+            img = Path(image_path)
+            if img.exists() and img.is_file():
+                try:
+                    import base64
+                    with open(img, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode("utf-8")
+                    messages.append({"type": "image", "data": {"file": f"base64://{b64}"}})
+                except Exception as img_err:
+                    log.warning("读取 QQ 待发送长图失败: %s", img_err)
+
+        payload = {
+            "group_id": int(str(group_id).strip()),
+            "message": messages,
+        }
+        resp = requests.post(url, json=payload, headers=headers, timeout=30)
+        resp_json = resp.json()
+        if resp_json.get("status") == "ok" or resp_json.get("retcode") == 0:
+            log.info("QQ 群 (%s) NapCat 消息推送成功！", group_id)
+            return True
+        log.warning("QQ 群 (%s) NapCat 返回错误: %s", group_id, resp_json)
+    except Exception as exc:
+        log.warning("QQ 群 (%s) NapCat 推送失败: %s", group_id, exc)
+    return False
+
+
+def send_wechat_personal_notice(
+    group_name: str,
+    title: str,
+    markdown_text: str,
+    image_path: Path | str | None = None,
+) -> bool:
+    """Send digest to a personal WeChat group using Windows PC WeChat UI automation."""
+    try:
+        from wechat_personal import send_to_wechat_group
+        return send_to_wechat_group(group_name, f"【{title}】\n\n{markdown_text}", image_path)
+    except Exception as exc:
+        log.warning("个人微信群自动化发送失败: %s", exc)
+        return False
+
+
+def dispatch_webhooks(title: str, markdown_text: str, image_path: Path | str | None = None) -> dict[str, bool]:
     """
     Check environment variables for configured webhook endpoints and dispatch notifications.
     All configured channels run concurrently so total latency stays near the slowest single
@@ -190,6 +255,22 @@ def dispatch_webhooks(title: str, markdown_text: str) -> dict[str, bool]:
     tg_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if tg_token and tg_chat_id:
         tasks.append(("telegram", send_telegram_notice, (tg_token, tg_chat_id, title, markdown_text)))
+
+    # 6. OneBot / NapCatQQ (QQ群推送)
+    onebot_url = os.getenv("ONEBOT_HTTP_URL", "").strip()
+    qq_groups = os.getenv("QQ_GROUP_ID", "").strip()
+    onebot_token = os.getenv("ONEBOT_ACCESS_TOKEN", "").strip()
+    if onebot_url and qq_groups:
+        for gid in re.split(r"[,;，；\s]+", qq_groups):
+            gid = gid.strip()
+            if gid:
+                channel_name = f"qq_group_{gid}"
+                tasks.append((channel_name, send_onebot_qq_group, (onebot_url, gid, title, markdown_text, image_path, onebot_token)))
+
+    # 7. PC 微信自动化 (普通个人微信群)
+    wechat_group = os.getenv("WECHAT_PERSONAL_GROUP", "").strip()
+    if wechat_group:
+        tasks.append(("wechat_personal", send_wechat_personal_notice, (wechat_group, title, markdown_text, image_path)))
 
     if not tasks:
         return {}

@@ -48,7 +48,7 @@ def _patch_digest_dependencies(monkeypatch, tmp_path, *, send_email, maintenance
     monkeypatch.setattr(main, "generate_rss_feed", lambda: maintenance.append("rss"))
     monkeypatch.setattr(main, "clean_old_outputs", lambda retention_days: maintenance.append("clean"))
     monkeypatch.setattr(main, "send_digest_email", send_email)
-    monkeypatch.setattr(main, "dispatch_webhooks", lambda title, report: {})
+    monkeypatch.setattr(main, "dispatch_webhooks", lambda *args, **kwargs: {})
     monkeypatch.setattr(main, "record_pushed_articles", lambda articles, is_dry_run: pushed.append(is_dry_run))
     return statuses, pushed
 

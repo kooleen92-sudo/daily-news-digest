@@ -369,9 +369,9 @@ def execute_digest(*, dry_run: bool = False) -> None:
                     log.error("邮件发送异常: %s", mail_err)
                     errors.append(f"邮件发送失败: {mail_err}")
 
-            # 9. 多渠道 Webhook 协同推送 (企业微信 / 飞书 / 钉钉 / Server酱 / Telegram)
+            # 9. 多渠道 Webhook 协同推送 (企业微信 / 飞书 / 钉钉 / Server酱 / Telegram / NapCat QQ群 / 微信群)
             digest_title = f"【每日财经与中国宏观深度简报】{now.strftime('%Y-%m-%d')}"
-            webhook_results = dispatch_webhooks(digest_title, report_markdown)
+            webhook_results = dispatch_webhooks(digest_title, report_markdown, image_path=long_image_path)
             if webhook_results:
                 status_record["webhooks_dispatched"] = webhook_results
 

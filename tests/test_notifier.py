@@ -158,3 +158,63 @@ def test_dispatch_webhooks_isolates_channel_failure(monkeypatch):
     results = dispatch_webhooks("Title", "Content")
 
     assert results == {"wecom": False, "feishu": True}
+
+
+@patch("requests.post")
+def test_send_onebot_qq_group_success(mock_post):
+    from notifier import send_onebot_qq_group
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"status": "ok", "retcode": 0}
+    mock_post.return_value = mock_resp
+
+    ok = send_onebot_qq_group("http://127.0.0.1:3000", "987654321", "Test Title", "Markdown text", access_token="secret")
+    assert ok is True
+    assert mock_post.called
+    args, kwargs = mock_post.call_args
+    assert args[0] == "http://127.0.0.1:3000/send_group_msg"
+    assert kwargs["headers"]["Authorization"] == "Bearer secret"
+    payload = kwargs["json"]
+    assert payload["group_id"] == 987654321
+    assert any(m["type"] == "text" for m in payload["message"])
+
+
+@patch("requests.post")
+def test_send_onebot_qq_group_with_image(mock_post, tmp_path):
+    from notifier import send_onebot_qq_group
+
+    img_file = tmp_path / "test.png"
+    img_file.write_bytes(b"\x89PNG\r\n\x1a\nfakeimagebytes")
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"status": "ok", "retcode": 0}
+    mock_post.return_value = mock_resp
+
+    ok = send_onebot_qq_group("http://127.0.0.1:3000", 112233, "Title", "Text", image_path=img_file)
+    assert ok is True
+    payload = mock_post.call_args.kwargs["json"]
+    types = [m["type"] for m in payload["message"]]
+    assert "text" in types
+    assert "image" in types
+    img_item = [m for m in payload["message"] if m["type"] == "image"][0]
+    assert img_item["data"]["file"].startswith("base64://")
+
+
+def test_dispatch_webhooks_includes_onebot(monkeypatch):
+    import notifier
+
+    calls = []
+    def mock_onebot(url, gid, title, text, img, token):
+        calls.append((gid, img))
+        return True
+
+    monkeypatch.setenv("ONEBOT_HTTP_URL", "http://127.0.0.1:3000")
+    monkeypatch.setenv("QQ_GROUP_ID", "111, 222")
+    monkeypatch.setattr(notifier, "send_onebot_qq_group", mock_onebot)
+
+    results = notifier.dispatch_webhooks("Title", "Content", image_path="dummy.png")
+    assert results == {"qq_group_111": True, "qq_group_222": True}
+    assert len(calls) == 2
+    assert calls[0] == ("111", "dummy.png")
+    assert calls[1] == ("222", "dummy.png")
+
